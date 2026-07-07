@@ -1,0 +1,285 @@
+---
+# ResourceGraphDefinition: ArgoCDTenantRepo
+#
+# One instance per repo (or per credential template) for a tenant.
+# The tenant writes creds into their Vault namespace at the agreed path:
+#
+#   <mount>/<pathPrefix>/<tenant>/repos/<name>
+#     username / password        (https)
+#     sshPrivateKey              (ssh)
+#
+# A VaultStaticSecret syncs that path into an Argo CD secret. Exactly one
+# of four variants materializes (includeWhen on secretType x credType) so
+# each secret carries only the keys that apply — no empty placeholder
+# keys, and repo-creds templates never carry repository-only fields.
+#
+#   secretType=repository -> project-scoped repo entry (data.project =
+#     tenant): even if a URL glob in some other AppProject matched it,
+#     the credential is only usable by this tenant's project.
+#   secretType=repo-creds -> credential template for every repo under the
+#     URL prefix. NOTE: repo-creds are NOT project-scoped in Argo CD —
+#     any project whose sourceRepos matches a URL under the prefix gets
+#     these creds. Only use prefixes that are unique to the tenant.
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: argocdtenantrepo.kro.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    kind: ArgoCDTenantRepo
+    spec:
+      # Must match an ArgoCDTenant instance's spec.tenant.
+      tenant: string | required=true
+      # Short repo name, used in resource/secret names and the Vault path.
+      name: string | required=true
+      url: string | required=true
+      # "repository" for a single repo, "repo-creds" for a credential
+      # template applied to every repo under the URL prefix.
+      secretType: string | default="repository"
+      repoType: string | default="git"   # git | helm
+      # Helm OCI registry (oci:// url). Argo CD models these as
+      # type=helm + enableOCI, not a distinct repo type.
+      enableOCI: boolean | default=false
+
+      vault:
+        # VaultAuth resource (in the argocd namespace) to authenticate with.
+        authRef: string | default="vault-auth"
+        # Tenant's Vault Enterprise namespace.
+        namespace: string | required=true
+        mount: string | default="kv"
+        pathPrefix: string | default="argocd"
+        refreshAfter: string | default="60s"
+
+      # Which credential shape lives at the Vault path.
+      credType: string | default="https"   # https | ssh
+
+    validation:
+      - expression: self.tenant.matches('^[a-z0-9]([a-z0-9-]{0,28}[a-z0-9])?$')
+        message: tenant must be a short RFC1123 name (lowercase alphanumeric and '-', max 30 chars)
+      - expression: self.name.matches('^[a-z0-9]([a-z0-9-]{0,28}[a-z0-9])?$')
+        message: name must be a short RFC1123 name (lowercase alphanumeric and '-', max 30 chars)
+      - expression: self.secretType in ['repository', 'repo-creds']
+        message: secretType must be repository or repo-creds
+      - expression: self.repoType in ['git', 'helm']
+        message: repoType must be git or helm (OCI registries are helm + enableOCI)
+      - expression: self.credType in ['https', 'ssh']
+        message: credType must be https or ssh
+      # Cred shape and URL scheme must agree.
+      - expression: >-
+          self.credType != 'https' || self.url.startsWith('https://') ||
+          self.url.startsWith('oci://')
+        message: credType=https requires an https:// (or oci://) url
+      - expression: >-
+          self.credType != 'ssh' || self.url.startsWith('git@') ||
+          self.url.startsWith('ssh://')
+        message: credType=ssh requires a git@ or ssh:// url
+      # OCI registries must be modeled the way Argo CD understands them.
+      - expression: >-
+          !self.url.startsWith('oci://') || (self.repoType == 'helm' && self.enableOCI)
+        message: oci:// urls require repoType=helm and enableOCI=true
+      - expression: '!self.enableOCI || self.repoType == ''helm'''
+        message: enableOCI only applies to repoType=helm
+      # has() guard: nested defaulting does not materialize an absent
+      # vault block, and an unguarded dereference errors instead of
+      # validating.
+      - expression: has(self.vault) && self.vault.namespace != ''
+        message: vault.namespace (the tenant's Vault namespace) is required
+      - expression: >-
+          !has(self.vault) || self.vault.refreshAfter.matches('^[0-9]+(s|m|h)$')
+        message: vault.refreshAfter must be a duration like 60s, 5m, 1h
+
+    status:
+      # Deterministic (same for every variant) — derived from spec so it
+      # never depends on which variant resource was included.
+      secretName: repo-${schema.spec.tenant}-${schema.spec.name}
+
+  resources:
+    # ------------------------------------------------------------------
+    # repository + https
+    # ------------------------------------------------------------------
+    - id: repoHttps
+      includeWhen:
+        - ${schema.spec.secretType == "repository"}
+        - ${schema.spec.credType == "https"}
+      template:
+        apiVersion: secrets.hashicorp.com/v1beta1
+        kind: VaultStaticSecret
+        metadata:
+          name: repo-${schema.spec.tenant}-${schema.spec.name}
+          namespace: argocd
+          labels:
+            indstri.com/tenant: ${schema.spec.tenant}
+        spec:
+          vaultAuthRef: ${schema.spec.vault.authRef}
+          namespace: ${schema.spec.vault.namespace}
+          mount: ${schema.spec.vault.mount}
+          type: kv-v2
+          path: ${schema.spec.vault.pathPrefix}/${schema.spec.tenant}/repos/${schema.spec.name}
+          refreshAfter: ${schema.spec.vault.refreshAfter}
+          hmacSecretData: true
+          destination:
+            name: repo-${schema.spec.tenant}-${schema.spec.name}
+            create: true
+            overwrite: true
+            labels:
+              argocd.argoproj.io/secret-type: repository
+              indstri.com/tenant: ${schema.spec.tenant}
+            transformation:
+              # Only render the templated keys below; never copy raw
+              # Vault data into the secret.
+              excludes:
+                - .*
+              excludeRaw: true
+              templates:
+                name:
+                  text: ${schema.spec.tenant}-${schema.spec.name}
+                url:
+                  text: ${schema.spec.url}
+                type:
+                  text: ${schema.spec.repoType}
+                enableOCI:
+                  text: ${string(schema.spec.enableOCI)}
+                # Hard project scoping: Argo CD only lets the named
+                # project use this repository credential.
+                project:
+                  text: ${schema.spec.tenant}
+                username:
+                  text: '{{- get .Secrets "username" -}}'
+                password:
+                  text: '{{- get .Secrets "password" -}}'
+
+    # ------------------------------------------------------------------
+    # repository + ssh
+    # ------------------------------------------------------------------
+    - id: repoSsh
+      includeWhen:
+        - ${schema.spec.secretType == "repository"}
+        - ${schema.spec.credType == "ssh"}
+      template:
+        apiVersion: secrets.hashicorp.com/v1beta1
+        kind: VaultStaticSecret
+        metadata:
+          name: repo-${schema.spec.tenant}-${schema.spec.name}
+          namespace: argocd
+          labels:
+            indstri.com/tenant: ${schema.spec.tenant}
+        spec:
+          vaultAuthRef: ${schema.spec.vault.authRef}
+          namespace: ${schema.spec.vault.namespace}
+          mount: ${schema.spec.vault.mount}
+          type: kv-v2
+          path: ${schema.spec.vault.pathPrefix}/${schema.spec.tenant}/repos/${schema.spec.name}
+          refreshAfter: ${schema.spec.vault.refreshAfter}
+          hmacSecretData: true
+          destination:
+            name: repo-${schema.spec.tenant}-${schema.spec.name}
+            create: true
+            overwrite: true
+            labels:
+              argocd.argoproj.io/secret-type: repository
+              indstri.com/tenant: ${schema.spec.tenant}
+            transformation:
+              excludes:
+                - .*
+              excludeRaw: true
+              templates:
+                name:
+                  text: ${schema.spec.tenant}-${schema.spec.name}
+                url:
+                  text: ${schema.spec.url}
+                type:
+                  text: ${schema.spec.repoType}
+                project:
+                  text: ${schema.spec.tenant}
+                sshPrivateKey:
+                  text: '{{- get .Secrets "sshPrivateKey" -}}'
+
+    # ------------------------------------------------------------------
+    # repo-creds + https — creds-only keys; repo-creds are matched by URL
+    # prefix and are NOT project-scoped (see header note).
+    # ------------------------------------------------------------------
+    - id: credsHttps
+      includeWhen:
+        - ${schema.spec.secretType == "repo-creds"}
+        - ${schema.spec.credType == "https"}
+      template:
+        apiVersion: secrets.hashicorp.com/v1beta1
+        kind: VaultStaticSecret
+        metadata:
+          name: repo-${schema.spec.tenant}-${schema.spec.name}
+          namespace: argocd
+          labels:
+            indstri.com/tenant: ${schema.spec.tenant}
+        spec:
+          vaultAuthRef: ${schema.spec.vault.authRef}
+          namespace: ${schema.spec.vault.namespace}
+          mount: ${schema.spec.vault.mount}
+          type: kv-v2
+          path: ${schema.spec.vault.pathPrefix}/${schema.spec.tenant}/repos/${schema.spec.name}
+          refreshAfter: ${schema.spec.vault.refreshAfter}
+          hmacSecretData: true
+          destination:
+            name: repo-${schema.spec.tenant}-${schema.spec.name}
+            create: true
+            overwrite: true
+            labels:
+              argocd.argoproj.io/secret-type: repo-creds
+              indstri.com/tenant: ${schema.spec.tenant}
+            transformation:
+              excludes:
+                - .*
+              excludeRaw: true
+              templates:
+                url:
+                  text: ${schema.spec.url}
+                type:
+                  text: ${schema.spec.repoType}
+                enableOCI:
+                  text: ${string(schema.spec.enableOCI)}
+                username:
+                  text: '{{- get .Secrets "username" -}}'
+                password:
+                  text: '{{- get .Secrets "password" -}}'
+
+    # ------------------------------------------------------------------
+    # repo-creds + ssh
+    # ------------------------------------------------------------------
+    - id: credsSsh
+      includeWhen:
+        - ${schema.spec.secretType == "repo-creds"}
+        - ${schema.spec.credType == "ssh"}
+      template:
+        apiVersion: secrets.hashicorp.com/v1beta1
+        kind: VaultStaticSecret
+        metadata:
+          name: repo-${schema.spec.tenant}-${schema.spec.name}
+          namespace: argocd
+          labels:
+            indstri.com/tenant: ${schema.spec.tenant}
+        spec:
+          vaultAuthRef: ${schema.spec.vault.authRef}
+          namespace: ${schema.spec.vault.namespace}
+          mount: ${schema.spec.vault.mount}
+          type: kv-v2
+          path: ${schema.spec.vault.pathPrefix}/${schema.spec.tenant}/repos/${schema.spec.name}
+          refreshAfter: ${schema.spec.vault.refreshAfter}
+          hmacSecretData: true
+          destination:
+            name: repo-${schema.spec.tenant}-${schema.spec.name}
+            create: true
+            overwrite: true
+            labels:
+              argocd.argoproj.io/secret-type: repo-creds
+              indstri.com/tenant: ${schema.spec.tenant}
+            transformation:
+              excludes:
+                - .*
+              excludeRaw: true
+              templates:
+                url:
+                  text: ${schema.spec.url}
+                type:
+                  text: ${schema.spec.repoType}
+                sshPrivateKey:
+                  text: '{{- get .Secrets "sshPrivateKey" -}}'

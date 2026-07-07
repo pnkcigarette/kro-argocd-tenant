@@ -1,0 +1,228 @@
+---
+# ResourceGraphDefinition: ArgoCDTenantCluster
+#
+# One instance per external cluster a tenant may deploy to. A single API
+# covers all providers via spec.provider; exactly one cluster-secret
+# resource materializes per instance (includeWhen):
+#
+#   eks     -> plain Secret, config.awsAuthConfig (EKS Pod Identity /
+#              IRSA on the Argo CD controllers assumes eks.roleARN).
+#              No secret material, no Vault.
+#   aks     -> plain Secret, config.execProviderConfig running
+#              argocd-k8s-auth azure with AAD workload identity.
+#              No secret material, no Vault.
+#   generic -> VaultStaticSecret. Tenant writes connection config into
+#              their Vault namespace at
+#                <mount>/<pathPrefix>/<tenant>/clusters/<name>
+#              key "config": {"bearerToken": ..., "tlsClientConfig": {...}}
+#
+# eks/aks API servers present certs signed by the cluster's own CA, so
+# caData (base64 CA bundle) is required for those providers; generic
+# carries its CA inside the Vault-held config JSON.
+#
+# Every variant is registered as cluster name "<tenant>-<name>" with
+# data.project = tenant (project-scoped cluster): it only resolves for
+# this tenant's AppProject and is invisible to every other project.
+# Reference it from ArgoCDTenant.spec.destinations as
+# "<tenant>-<name>/<namespace>".
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: argocdtenantcluster.kro.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    kind: ArgoCDTenantCluster
+    spec:
+      # Must match an ArgoCDTenant instance's spec.tenant.
+      tenant: string | required=true
+      # Short cluster name; registered in Argo CD as <tenant>-<name>.
+      name: string | required=true
+      # Kube API server URL of the target cluster.
+      server: string | required=true
+      # eks | aks | generic
+      provider: string | default="generic"
+
+      # Base64-encoded CA bundle of the target cluster's API server.
+      # Required for eks/aks (their certs are signed by the cluster CA);
+      # must be empty for generic (CA travels in the Vault config JSON).
+      caData: string | default=""
+
+      # Allow the tenant to manage cluster-scoped resources on this
+      # cluster (still bounded by the AppProject clusterResourceWhitelist).
+      clusterResources: boolean | default=false
+
+      # provider=eks only.
+      eks:
+        clusterName: string | default=""
+        # IAM role the Argo CD controllers assume via Pod Identity/IRSA.
+        roleARN: string | default=""
+
+      # provider=aks only. The block is REQUIRED when provider=aks
+      # (use "aks: {}" for defaults) so templates never dereference an
+      # absent object.
+      aks:
+        environment: string | default="AzurePublicCloud"
+
+      # provider=generic only.
+      vault:
+        # VaultAuth resource (in the argocd namespace) to authenticate with.
+        authRef: string | default="vault-auth"
+        # Tenant's Vault Enterprise namespace.
+        namespace: string | default=""
+        mount: string | default="kv"
+        pathPrefix: string | default="argocd"
+        refreshAfter: string | default="60s"
+
+    validation:
+      # Optional blocks are guarded with has() throughout: nested
+      # defaulting does not materialize absent parent objects, and an
+      # unguarded dereference would error instead of validating.
+      - expression: self.provider in ['eks', 'aks', 'generic']
+        message: provider must be one of eks, aks, generic
+      - expression: self.tenant.matches('^[a-z0-9]([a-z0-9-]{0,28}[a-z0-9])?$')
+        message: tenant must be a short RFC1123 name (lowercase alphanumeric and '-', max 30 chars)
+      - expression: self.name.matches('^[a-z0-9]([a-z0-9-]{0,28}[a-z0-9])?$')
+        message: name must be a short RFC1123 name (lowercase alphanumeric and '-', max 30 chars)
+      - expression: self.server.startsWith('https://')
+        message: server must be an https:// URL
+      # eks/aks API certs chain to the cluster's private CA — without
+      # caData Argo CD fails TLS verification against the endpoint.
+      - expression: self.provider == 'generic' || self.caData != ''
+        message: provider=eks/aks requires caData (base64 CA bundle of the target cluster)
+      - expression: self.provider != 'generic' || self.caData == ''
+        message: caData may only be set for eks/aks (generic carries its CA in the Vault config JSON)
+      - expression: >-
+          self.caData == '' || self.caData.matches('^[A-Za-z0-9+/=]+$')
+        message: caData must be base64
+      # eks requires its block; the ARN must be an IAM role.
+      - expression: >-
+          self.provider != 'eks' || (has(self.eks) && self.eks.clusterName != '' &&
+          self.eks.roleARN.matches('^arn:aws:iam::[0-9]{12}:role/.+$'))
+        message: provider=eks requires eks.clusterName and a valid eks.roleARN (arn:aws:iam::<account>:role/...)
+      # Unused provider blocks must stay empty — a filled-in block that
+      # will be silently ignored is a misconfiguration.
+      - expression: >-
+          self.provider == 'eks' || !has(self.eks) ||
+          (self.eks.clusterName == '' && self.eks.roleARN == '')
+        message: eks.* may only be set when provider=eks
+      # The aks block must be PRESENT for provider=aks — the template
+      # references aks.environment directly, and nested defaults only
+      # apply when the parent object exists.
+      - expression: >-
+          self.provider != 'aks' || (has(self.aks) && self.aks.environment in
+          ['AzurePublicCloud', 'AzureUSGovernmentCloud', 'AzureChinaCloud'])
+        message: 'provider=aks requires the aks block ("aks: {}" for defaults) with a valid environment'
+      # generic requires the tenant's Vault namespace; identity-based
+      # providers must not carry Vault config that would be ignored.
+      - expression: >-
+          self.provider != 'generic' || (has(self.vault) && self.vault.namespace != '')
+        message: provider=generic requires vault.namespace (the tenant's Vault namespace)
+      - expression: >-
+          self.provider == 'generic' || !has(self.vault) || self.vault.namespace == ''
+        message: vault.* may only be set when provider=generic (eks/aks use ambient pod identity)
+      - expression: >-
+          !has(self.vault) || self.vault.refreshAfter.matches('^[0-9]+(s|m|h)$')
+        message: vault.refreshAfter must be a duration like 60s, 5m, 1h
+
+    status:
+      clusterName: ${schema.spec.tenant}-${schema.spec.name}
+
+  resources:
+    # ------------------------------------------------------------------
+    # provider=eks — IAM auth, no secret material.
+    # ------------------------------------------------------------------
+    - id: eksClusterSecret
+      includeWhen:
+        - ${schema.spec.provider == "eks"}
+      template:
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: cluster-${schema.spec.tenant}-${schema.spec.name}
+          namespace: argocd
+          labels:
+            argocd.argoproj.io/secret-type: cluster
+            indstri.com/tenant: ${schema.spec.tenant}
+        type: Opaque
+        stringData:
+          name: ${schema.spec.tenant}-${schema.spec.name}
+          server: ${schema.spec.server}
+          project: ${schema.spec.tenant}
+          clusterResources: ${string(schema.spec.clusterResources)}
+          config: >-
+            {"awsAuthConfig":{"clusterName":"${schema.spec.eks.clusterName}","roleARN":"${schema.spec.eks.roleARN}"},"tlsClientConfig":{"insecure":false,"caData":"${schema.spec.caData}"}}
+
+    # ------------------------------------------------------------------
+    # provider=aks — AAD workload identity via argocd-k8s-auth.
+    # ------------------------------------------------------------------
+    - id: aksClusterSecret
+      includeWhen:
+        - ${schema.spec.provider == "aks"}
+      template:
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: cluster-${schema.spec.tenant}-${schema.spec.name}
+          namespace: argocd
+          labels:
+            argocd.argoproj.io/secret-type: cluster
+            indstri.com/tenant: ${schema.spec.tenant}
+        type: Opaque
+        stringData:
+          name: ${schema.spec.tenant}-${schema.spec.name}
+          server: ${schema.spec.server}
+          project: ${schema.spec.tenant}
+          clusterResources: ${string(schema.spec.clusterResources)}
+          config: >-
+            {"execProviderConfig":{"command":"argocd-k8s-auth","args":["azure"],"apiVersion":"client.authentication.k8s.io/v1beta1","env":{"AAD_ENVIRONMENT_NAME":"${schema.spec.aks.environment}","AAD_LOGIN_METHOD":"workloadidentity"}},"tlsClientConfig":{"insecure":false,"caData":"${schema.spec.caData}"}}
+
+    # ------------------------------------------------------------------
+    # provider=generic — bearer token / TLS creds synced from the
+    # tenant's Vault namespace.
+    # ------------------------------------------------------------------
+    - id: genericClusterSecret
+      includeWhen:
+        - ${schema.spec.provider == "generic"}
+      template:
+        apiVersion: secrets.hashicorp.com/v1beta1
+        kind: VaultStaticSecret
+        metadata:
+          name: cluster-${schema.spec.tenant}-${schema.spec.name}
+          namespace: argocd
+          labels:
+            indstri.com/tenant: ${schema.spec.tenant}
+        spec:
+          vaultAuthRef: ${schema.spec.vault.authRef}
+          namespace: ${schema.spec.vault.namespace}
+          mount: ${schema.spec.vault.mount}
+          type: kv-v2
+          path: ${schema.spec.vault.pathPrefix}/${schema.spec.tenant}/clusters/${schema.spec.name}
+          refreshAfter: ${schema.spec.vault.refreshAfter}
+          hmacSecretData: true
+          destination:
+            name: cluster-${schema.spec.tenant}-${schema.spec.name}
+            create: true
+            overwrite: true
+            labels:
+              argocd.argoproj.io/secret-type: cluster
+              indstri.com/tenant: ${schema.spec.tenant}
+            transformation:
+              # Only render the templated keys below; never copy raw
+              # Vault data into the secret.
+              excludes:
+                - .*
+              excludeRaw: true
+              templates:
+                name:
+                  text: ${schema.spec.tenant}-${schema.spec.name}
+                server:
+                  text: ${schema.spec.server}
+                # Hard project scoping: this cluster only resolves for
+                # the tenant's AppProject.
+                project:
+                  text: ${schema.spec.tenant}
+                clusterResources:
+                  text: ${string(schema.spec.clusterResources)}
+                config:
+                  text: '{{- get .Secrets "config" -}}'

@@ -1,0 +1,321 @@
+---
+# Platform-level guardrails, applied once (not per tenant).
+# Kyverno >= 1.14 ValidatingPolicy (policies.kyverno.io/v1alpha1) — the
+# Kubernetes ValidatingAdmissionPolicy CEL spec plus Kyverno's CEL
+# libraries (resource.List for the claim registry).
+#
+#   argocd-tenant-project-binding     — apps/appsets in tenant namespaces
+#                                       must bind to the tenant's project
+#                                       (replaces the per-tenant
+#                                       ClusterPolicy the RGD used to emit)
+#   argocd-appproject-guard           — sourceNamespaces invariant on all
+#                                       AppProjects
+#   argocd-tenant-destination-guard   — no system / other-tenant namespaces
+#                                       in ArgoCDTenant destinations
+#   argocd-tenant-claims              — cross-tenant uniqueness of
+#                                       destination + source namespace
+#                                       claims, first-come-first-claim
+#
+# The claims policy needs Kyverno's admission controller to be able to
+# list argocdtenants — the aggregated ClusterRole at the bottom grants it.
+
+# Defense-in-depth for the Argo CD binding rule, and a readable failure
+# at admission instead of an app stuck in an error state. Matches by the
+# indstri.com/tenant namespace label (the RGD labels the derived
+# namespace; label any extraSourceNamespaces at approval time).
+apiVersion: policies.kyverno.io/v1alpha1
+kind: ValidatingPolicy
+metadata:
+  name: argocd-tenant-project-binding
+spec:
+  validationActions: [Deny]
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchExpressions:
+        - key: indstri.com/tenant
+          operator: Exists
+    resourceRules:
+      - apiGroups: ["argoproj.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["applications", "applicationsets"]
+  variables:
+    - name: tenant
+      expression: namespaceObject.metadata.labels['indstri.com/tenant']
+  validations:
+    - expression: >-
+        object.kind != 'Application' ||
+        (has(object.spec.project) && object.spec.project == variables.tenant)
+      messageExpression: >-
+        'Applications in this namespace must set spec.project=' + variables.tenant
+    - expression: >-
+        object.kind != 'ApplicationSet' ||
+        (has(object.spec.template.spec.project) &&
+         object.spec.template.spec.project == variables.tenant)
+      messageExpression: >-
+        'ApplicationSets in this namespace must template spec.project=' + variables.tenant
+---
+# The whole tenancy model rests on: an Application in namespace X can
+# only use project P if P.sourceNamespaces contains X, and each tenant
+# namespace is listed by exactly ONE project. This keeps the second half
+# true:
+#   - tenant AppProjects (labeled by the RGD) may only list tenant-*
+#     namespaces, never wildcards
+#   - every other AppProject (platform, legacy, default) must not use
+#     '*' or cover tenant namespaces at all
+apiVersion: policies.kyverno.io/v1alpha1
+kind: ValidatingPolicy
+metadata:
+  name: argocd-appproject-guard
+spec:
+  validationActions: [Deny]
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["argoproj.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["appprojects"]
+  variables:
+    - name: isTenantProject
+      expression: >-
+        has(object.metadata.labels) && 'indstri.com/tenant' in object.metadata.labels
+    - name: sourceNamespaces
+      expression: >-
+        has(object.spec.sourceNamespaces) ? object.spec.sourceNamespaces : []
+  validations:
+    # sourceNamespaces entries are GLOBS ('t*', '*ant-*', '[t]enant-x'
+    # all match tenant namespaces without literally starting with
+    # 'tenant'), so both branches must reject glob metacharacters
+    # outright — prefix checks alone are bypassable.
+    - expression: >-
+        variables.sourceNamespaces.all(ns,
+          !ns.contains('*') && !ns.contains('?') && !ns.contains('['))
+      message: >-
+        AppProject sourceNamespaces must be explicit namespace names —
+        glob patterns could cover tenant namespaces
+    - expression: >-
+        variables.isTenantProject
+          ? variables.sourceNamespaces.all(ns, ns.startsWith('tenant-'))
+          : variables.sourceNamespaces.all(ns, !ns.startsWith('tenant'))
+      message: >-
+        only RGD-managed tenant AppProjects may list tenant-* source
+        namespaces; other AppProjects must not cover tenant namespaces
+---
+# Destinations must never target platform/system namespaces, or another
+# tenant's app namespace. Deploying into their OWN app namespace
+# (tenant-<tenant>) is allowed.
+apiVersion: policies.kyverno.io/v1alpha1
+kind: ValidatingPolicy
+metadata:
+  name: argocd-tenant-destination-guard
+spec:
+  validationActions: [Deny]
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["kro.run"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["argocdtenants"]
+  validations:
+    # Friendly shape error first; the rules below filter to well-formed
+    # entries so a malformed instance gets this message instead of a CEL
+    # index error (KRO's schema validation may not be enforced at the
+    # API server, so admission cannot assume shape).
+    - expression: >-
+        (has(object.spec.destinations) ? object.spec.destinations : [])
+          .all(d, d.split('/').size() == 2 && d.split('/')[0] != '' && d.split('/')[1] != '')
+      message: destinations must be "<clusterName>/<namespace>"
+    # Denylist belt for ALL clusters (external ones can't be inspected
+    # from the hub). The positive-claim check for in-cluster namespaces
+    # lives in argocd-tenant-claims.
+    - expression: >-
+        (has(object.spec.destinations) ? object.spec.destinations : [])
+          .filter(d, d.split('/').size() == 2)
+          .all(d,
+            d.split('/')[1] == 'tenant-' + object.spec.tenant ||
+            (!(d.split('/')[1] in ['default', 'argocd', 'kro', 'kyverno',
+                                   'vault-secrets-operator']) &&
+             !d.split('/')[1].startsWith('kube-') &&
+             !d.split('/')[1].startsWith('tenant-')))
+      message: >-
+        destinations must not target platform/system namespaces or other
+        tenants' app namespaces
+---
+# Destination and source namespaces are ownership claims on (possibly
+# shared) clusters. Claims are compared by SERVER URL, not cluster name:
+# two tenants can legitimately register the same physical cluster under
+# different names, so "<name>/<namespace>" strings alone would let both
+# claim the same namespace. A destination's cluster name is resolved to
+# its server via the ArgoCDTenantCluster instances (in-cluster resolves
+# to the local API server); unregistered names fall back to name-based
+# comparison so ordering (tenant before its clusters) still works.
+#
+# First come first claimed; disputes are settled in PR review of the
+# tenant instances, not at deploy time. failurePolicy Fail => if Kyverno
+# cannot run the lookups, tenant writes are denied, not waved through.
+#
+# ORDERING: this policy resource.List's argocdtenants, argocdtenantclusters,
+# and namespaces. Both RGDs must be applied (and their CRDs established)
+# BEFORE this policy, or every ArgoCDTenant write fails closed with a
+# lookup error.
+#
+# Admission checks race under concurrent writes (Kyverno lists its
+# informer cache), so background evaluation is enabled as the detector:
+# a claim conflict that slips through a race surfaces in PolicyReports
+# on the next background scan.
+apiVersion: policies.kyverno.io/v1alpha1
+kind: ValidatingPolicy
+metadata:
+  name: argocd-tenant-claims
+spec:
+  validationActions: [Deny]
+  failurePolicy: Fail
+  evaluation:
+    admission:
+      enabled: true
+    background:
+      enabled: true
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["kro.run"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["argocdtenants"]
+  variables:
+    - name: allTenants
+      expression: >-
+        resource.List("kro.run/v1alpha1", "argocdtenants", "").items
+    - name: otherTenants
+      expression: >-
+        variables.allTenants.filter(t, t.spec.tenant != object.spec.tenant)
+    - name: clusterList
+      expression: >-
+        resource.List("kro.run/v1alpha1", "argocdtenantclusters", "").items
+    - name: hubNamespaces
+      expression: >-
+        resource.List("v1", "namespaces", "").items
+    # Well-formed destinations only — malformed shapes get the friendly
+    # error from argocd-tenant-destination-guard, not a CEL index error.
+    - name: requestedDests
+      expression: >-
+        (has(object.spec.destinations) ? object.spec.destinations : [])
+          .filter(d, d.split('/').size() == 2)
+    # Canonical claim strings: "<server-or-name>|<namespace>".
+    - name: requestedClaims
+      expression: >-
+        variables.requestedDests.map(d,
+          (d.split('/')[0] == 'in-cluster'
+            ? 'https://kubernetes.default.svc'
+            : (variables.clusterList.exists(c, c.spec.tenant + '-' + c.spec.name == d.split('/')[0])
+                ? variables.clusterList.filter(c, c.spec.tenant + '-' + c.spec.name == d.split('/')[0])[0].spec.server
+                : d.split('/')[0]))
+          + '|' + d.split('/')[1])
+    - name: requestedSourceNs
+      expression: >-
+        ['tenant-' + object.spec.tenant] +
+        (has(object.spec.extraSourceNamespaces) ? object.spec.extraSourceNamespaces : [])
+  validations:
+    # A tenant is defined by exactly one instance. Without this, a second
+    # instance reusing spec.tenant would be invisible to the claim checks
+    # below (they compare by tenant) and would fight over the same
+    # AppProject and namespace.
+    - expression: >-
+        !variables.allTenants.exists(t,
+          t.spec.tenant == object.spec.tenant &&
+          (t.metadata.name != object.metadata.name ||
+           t.metadata.namespace != object.metadata.namespace))
+      message: >-
+        another ArgoCDTenant instance already defines this tenant
+    # Namespace claims, canonicalized by server so cluster-name aliases
+    # for the same physical cluster cannot dodge them. Other instances'
+    # destinations are has()-guarded and shape-filtered: one malformed
+    # legacy instance must not error out everyone else's admission.
+    - expression: >-
+        !variables.requestedClaims.exists(rc,
+          variables.otherTenants.exists(t,
+            (has(t.spec.destinations) ? t.spec.destinations : [])
+              .filter(od, od.split('/').size() == 2)
+              .exists(od,
+                ((od.split('/')[0] == 'in-cluster'
+                  ? 'https://kubernetes.default.svc'
+                  : (variables.clusterList.exists(c, c.spec.tenant + '-' + c.spec.name == od.split('/')[0])
+                      ? variables.clusterList.filter(c, c.spec.tenant + '-' + c.spec.name == od.split('/')[0])[0].spec.server
+                      : od.split('/')[0]))
+                + '|' + od.split('/')[1]) == rc)))
+      message: >-
+        one or more destination namespaces are already claimed by another
+        tenant (clusters are compared by server URL, so registering the
+        same cluster under a different name does not evade the claim)
+    # Exact cluster ownership: a destination may only reference in-cluster
+    # or a cluster registered by an ArgoCDTenantCluster of THIS tenant.
+    # The RGD's startsWith(tenant + '-') check alone is bypassable when
+    # one tenant name is a hyphen-prefix of another (tenant "payments"
+    # matching cluster "payments-eu-prod" of tenant "payments-eu").
+    - expression: >-
+        !variables.requestedDests.exists(d,
+          variables.clusterList.exists(c,
+            c.spec.tenant != object.spec.tenant &&
+            d.split('/')[0] == c.spec.tenant + '-' + c.spec.name))
+      message: >-
+        one or more destinations reference a cluster registered by
+        another tenant
+    # Positive claim check for the hub: an in-cluster destination
+    # namespace that ALREADY EXISTS must be the tenant's own, labeled as
+    # theirs, or explicitly marked tenant-deployable. This inverts the
+    # denylist — platform namespaces not on the denylist (monitoring,
+    # ingress, cert-manager, ...) are protected by default. Not-yet-
+    # existing namespaces are claimable (the tenant creates them via the
+    # claim). External clusters can't be inspected from the hub; the
+    # denylist in argocd-tenant-destination-guard still covers those.
+    - expression: >-
+        variables.requestedDests
+          .filter(d, d.split('/')[0] == 'in-cluster')
+          .all(d,
+            d.split('/')[1] == 'tenant-' + object.spec.tenant ||
+            !variables.hubNamespaces.exists(n, n.metadata.name == d.split('/')[1]) ||
+            variables.hubNamespaces.exists(n,
+              n.metadata.name == d.split('/')[1] &&
+              has(n.metadata.labels) && (
+                ('indstri.com/tenant' in n.metadata.labels &&
+                 n.metadata.labels['indstri.com/tenant'] == object.spec.tenant) ||
+                ('indstri.com/tenant-deployable' in n.metadata.labels &&
+                 n.metadata.labels['indstri.com/tenant-deployable'] == 'true'))))
+      message: >-
+        an existing in-cluster destination namespace must belong to this
+        tenant or be labeled indstri.com/tenant-deployable="true"
+    - expression: >-
+        !variables.requestedSourceNs.exists(ns,
+          variables.otherTenants.exists(t,
+            ns == 'tenant-' + t.spec.tenant ||
+            (has(t.spec.extraSourceNamespaces) && ns in t.spec.extraSourceNamespaces)))
+      message: >-
+        one or more source namespaces (derived or extra) are already
+        claimed by another tenant
+---
+# Lets Kyverno run the resource.List lookups in argocd-tenant-claims —
+# the admission controller at admission time, the reports controller for
+# the background conflict scans. Aggregates via the
+# rbac.kyverno.io/aggregate-to-* selectors on Kyverno 1.11+ charts; the
+# app.kubernetes.io trio covers older charts (adjust instance if your
+# release isn't named "kyverno").
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kyverno:aggregate-to-admission-controller:argocdtenants
+  labels:
+    rbac.kyverno.io/aggregate-to-admission-controller: "true"
+    rbac.kyverno.io/aggregate-to-reports-controller: "true"
+    app.kubernetes.io/part-of: kyverno
+    app.kubernetes.io/instance: kyverno
+    app.kubernetes.io/component: admission-controller
+rules:
+  - apiGroups: ["kro.run"]
+    resources: ["argocdtenants", "argocdtenantclusters"]
+    verbs: ["get", "list", "watch"]
+  # For the positive claim check on existing hub namespaces.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]

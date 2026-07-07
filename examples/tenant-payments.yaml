@@ -1,0 +1,88 @@
+---
+apiVersion: kro.run/v1alpha1
+kind: ArgoCDTenant
+metadata:
+  name: payments
+  namespace: argocd
+spec:
+  tenant: payments
+  description: Payments team tenant
+  # Apps/appsets live in tenant-payments (derived, created by the RGD,
+  # covered by the tenant-* glob in argocd-cmd-params-cm);
+  # extraSourceNamespaces / clusterResourceWhitelist omitted (optional).
+  # Explicit namespace claims — no wildcards. Adding a namespace later is
+  # a PR appending an entry here; admission policy enforces that no other
+  # tenant already claims it.
+  destinations:
+    - in-cluster/payments-dev
+    - in-cluster/payments-staging
+    - payments-prod-east/payments-prod   # ArgoCDTenantCluster below
+  sourceRepos:
+    - https://github.com/indstri/payments-*
+  adminGroup: idp:payments-admins
+---
+apiVersion: kro.run/v1alpha1
+kind: ArgoCDTenantRepo
+metadata:
+  name: payments-core
+  namespace: argocd
+spec:
+  tenant: payments
+  name: core
+  url: https://github.com/indstri/payments-core.git
+  credType: https
+  vault:
+    namespace: payments        # tenant's Vault Enterprise namespace
+    mount: kv
+    pathPrefix: argocd         # creds at kv/argocd/payments/repos/core
+---
+# Credential template covering every repo under the org prefix instead of
+# a single repo — same Vault path convention, secretType flips the label.
+apiVersion: kro.run/v1alpha1
+kind: ArgoCDTenantRepo
+metadata:
+  name: payments-org-creds
+  namespace: argocd
+spec:
+  tenant: payments
+  name: org-creds
+  url: https://github.com/indstri/payments-
+  secretType: repo-creds
+  credType: https
+  vault:
+    namespace: payments
+---
+# EKS cluster, registered project-scoped as "payments-prod-east".
+# No secret material — the Argo CD controllers assume the role via
+# EKS Pod Identity / IRSA.
+apiVersion: kro.run/v1alpha1
+kind: ArgoCDTenantCluster
+metadata:
+  name: payments-prod-east
+  namespace: argocd
+spec:
+  tenant: payments
+  name: prod-east
+  provider: eks
+  server: https://ABC123.gr7.us-east-1.eks.amazonaws.com
+  # Cluster CA bundle (aws eks describe-cluster --query cluster.certificateAuthority.data)
+  caData: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tRVhBTVBMRQ==
+  eks:
+    clusterName: payments-prod-east
+    roleARN: arn:aws:iam::123456789012:role/argocd-deployer-payments
+---
+# On-prem/generic cluster: bearer-token config synced from the tenant's
+# Vault namespace (kv/argocd/payments/clusters/onprem-dc1, key "config":
+# {"bearerToken": ..., "tlsClientConfig": {...}}).
+apiVersion: kro.run/v1alpha1
+kind: ArgoCDTenantCluster
+metadata:
+  name: payments-onprem-dc1
+  namespace: argocd
+spec:
+  tenant: payments
+  name: onprem-dc1
+  provider: generic
+  server: https://dc1.k8s.indstri.com:6443
+  vault:
+    namespace: payments

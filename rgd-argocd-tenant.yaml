@@ -1,0 +1,226 @@
+---
+# ResourceGraphDefinition: ArgoCDTenant
+#
+# One instance per tenant. Creates:
+#   - The tenant's app namespace, tenant-<tenant>. The prefix is fixed
+#     platform-wide: it must match the apps-in-any-namespace glob
+#     (tenant-*) in argocd-cmd-params-cm and the guards in
+#     platform-policies.yaml, so it is deliberately not configurable.
+#   - AppProject scoped to the tenant's repos, clusters, and source
+#     namespaces (apps/appsets-in-any-namespace)
+#   - Role/RoleBinding granting the tenant's IdP group management of
+#     Applications/ApplicationSets in their namespace
+#
+# Project-binding enforcement (apps/appsets must set the tenant's
+# project) is a single platform-wide ValidatingPolicy keyed on the
+# indstri.com/tenant namespace label — see platform-policies.yaml.
+#
+# Repos + creds: ArgoCDTenantRepo RGD. Clusters: ArgoCDTenantCluster RGD.
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: argocdtenant.kro.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    kind: ArgoCDTenant
+    spec:
+      # Tenant short name. Used as the AppProject name and the value every
+      # tenant Application/ApplicationSet must set as spec.project.
+      tenant: string | required=true
+      description: string | default=""
+
+      # Additional namespaces the tenant may create apps/appsets in,
+      # beyond the derived tenant-<tenant>. These must also match the
+      # tenant-* glob; label them indstri.com/tenant=<tenant> at approval
+      # time so the platform project-binding policy covers them.
+      extraSourceNamespaces: '[]string'
+
+      # Where the tenant may deploy, as "<clusterName>/<namespace>".
+      # These are explicit namespace CLAIMS, not patterns — no wildcards.
+      # Cross-tenant uniqueness, cluster ownership, and the
+      # system-namespace denylist are enforced at admission by
+      # platform-policies.yaml.
+      #   - in-cluster/payments-dev
+      #   - payments-prod-east/payments-prod
+      # Cluster names other than in-cluster come from ArgoCDTenantCluster
+      # instances (<tenant>-<name>). Applications targeting an external
+      # cluster must use destination.name (see README).
+      destinations: '[]string'
+
+      # Allowed source repo URLs / globs. Keep in sync with the
+      # ArgoCDTenantRepo instances you create for this tenant.
+      # e.g. ["https://github.com/indstri/payments-*"]
+      sourceRepos: '[]string'
+
+      # IdP group granted the tenant admin role on the AppProject.
+      adminGroup: string | default=""
+
+      # Cluster-scoped resources the tenant may manage, as "group/Kind"
+      # (default: none).
+      clusterResourceWhitelist: '[]string'
+    validation:
+      # Optional list fields are guarded with has() throughout: nested
+      # defaulting does not materialize absent fields, and an unguarded
+      # dereference would error instead of validating.
+      - expression: self.tenant.matches('^[a-z0-9]([a-z0-9-]{0,28}[a-z0-9])?$')
+        message: tenant must be a short RFC1123 name (lowercase alphanumeric and '-', max 30 chars)
+      - expression: >-
+          !has(self.extraSourceNamespaces) ||
+          self.extraSourceNamespaces.all(ns, ns.startsWith('tenant-') && !ns.contains('*'))
+        message: >-
+          extraSourceNamespaces must start with tenant- (no wildcards) so
+          they are covered by the Argo CD apps-in-any-namespace glob
+      - expression: has(self.destinations) && self.destinations.size() > 0
+        message: at least one destination is required
+      # Destinations are ownership claims on shared clusters — explicit
+      # namespaces only, so admission policy can check uniqueness.
+      - expression: >-
+          !has(self.destinations) || self.destinations.all(d,
+            d.split('/').size() == 2 && d.split('/')[0] != '' &&
+            d.split('/')[1] != '' && !d.contains('*') && !d.contains('?'))
+        message: >-
+          destinations must be "<clusterName>/<namespace>" — explicit
+          namespace claims, no wildcards
+      # Cheap self-consistency check only: exact cluster ownership
+      # (including hyphen-prefix collisions between tenant names) is
+      # verified against ArgoCDTenantCluster instances by
+      # platform-policies.yaml at admission.
+      - expression: >-
+          !has(self.destinations) || self.destinations.all(d,
+            d.split('/')[0] == 'in-cluster' ||
+            d.split('/')[0].startsWith(self.tenant + '-'))
+        message: >-
+          destination cluster must be in-cluster or one of this tenant's
+          clusters (<tenant>-<name>)
+      - expression: >-
+          !has(self.sourceRepos) || self.sourceRepos.all(r,
+            r.startsWith('https://') || r.startsWith('git@') ||
+            r.startsWith('ssh://') || r.startsWith('oci://'))
+        message: sourceRepos entries must be https://, git@, ssh://, or oci:// URLs/globs
+      - expression: >-
+          !has(self.clusterResourceWhitelist) ||
+          self.clusterResourceWhitelist.all(gk,
+            gk.split('/').size() == 2 && gk.split('/')[1] != '')
+        message: clusterResourceWhitelist entries must be "group/Kind" (empty group as "/Kind")
+    status:
+      appProject: ${appProject.metadata.name}
+      tenantNamespace: ${tenantNamespace.metadata.name}
+
+  resources:
+    # The namespace tenant apps/appsets live in. Derived, not chosen, so
+    # it always matches the argocd-cmd-params-cm glob. The appProject
+    # reference in the annotation is deliberate: it makes KRO create the
+    # AppProject (the fence) before the Namespace (the thing that grants
+    # the tenant a place to act).
+    #
+    # CAVEAT: this Namespace is cluster-scoped while the ArgoCDTenant
+    # instance is namespaced, and Kubernetes GC does not honor
+    # cluster-scoped dependents of namespaced owners. Verify on your KRO
+    # version whether it is cleaned up on instance deletion; if not, the
+    # offboarding runbook must delete tenant-<tenant> explicitly.
+    - id: tenantNamespace
+      template:
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: tenant-${schema.spec.tenant}
+          labels:
+            indstri.com/tenant: ${schema.spec.tenant}
+          annotations:
+            indstri.com/app-project: ${appProject.metadata.name}
+
+    - id: appProject
+      template:
+        apiVersion: argoproj.io/v1alpha1
+        kind: AppProject
+        metadata:
+          name: ${schema.spec.tenant}
+          # Fixed: the Argo CD namespace is a platform invariant (the
+          # policy denylist and repo/cluster secret RGDs assume it), so
+          # it is deliberately not a schema knob.
+          namespace: argocd
+          labels:
+            indstri.com/tenant: ${schema.spec.tenant}
+        spec:
+          description: ${schema.spec.description}
+          # Only repos onboarded for this tenant.
+          sourceRepos: >-
+            ${has(schema.spec.sourceRepos) ? schema.spec.sourceRepos : []}
+          # Apps/appsets in the derived namespace plus vetted extras.
+          sourceNamespaces: >-
+            ${["tenant-" + schema.spec.tenant] +
+              (has(schema.spec.extraSourceNamespaces) ? schema.spec.extraSourceNamespaces : [])}
+          # Every destination is emitted by name; in-cluster entries get
+          # an ADDITIONAL server-form entry so apps may target the local
+          # cluster by name or by URL (a project's destination list is
+          # OR-matched, extra entries are harmless). External clusters
+          # remain name-only — apps must use destination.name.
+          # Built with map/filter/+ only — no object-valued ternaries,
+          # which KRO's expression support is not documented to cover.
+          destinations: >-
+            ${schema.spec.destinations.map(d,
+                {"name": d.split("/")[0], "namespace": d.split("/")[1]}) +
+              schema.spec.destinations.filter(d, d.split("/")[0] == "in-cluster").map(d,
+                {"server": "https://kubernetes.default.svc", "namespace": d.split("/")[1]})}
+          clusterResourceWhitelist: >-
+            ${(has(schema.spec.clusterResourceWhitelist) ? schema.spec.clusterResourceWhitelist : [])
+              .map(gk, {"group": gk.split("/")[0], "kind": gk.split("/")[1]})}
+          namespaceResourceBlacklist:
+            - group: ""
+              kind: ResourceQuota
+            - group: ""
+              kind: LimitRange
+          orphanedResources:
+            warn: true
+          # Static role, CEL only on the groups list: a role with no
+          # groups is valid in Argo CD (usable for tokens), while a role
+          # with an empty-string group is rejected. Keeping the object
+          # itself as plain YAML avoids CEL object construction, which
+          # KRO's expression support is not documented to cover.
+          roles:
+            - name: admin
+              description: Tenant admin
+              policies:
+                - p, proj:${schema.spec.tenant}:admin, applications, *, ${schema.spec.tenant}/*, allow
+                - p, proj:${schema.spec.tenant}:admin, applicationsets, *, ${schema.spec.tenant}/*, allow
+              groups: '${schema.spec.adminGroup == "" ? [] : [schema.spec.adminGroup]}'
+
+    # Tenant self-service inside their app namespace: manage
+    # Applications/ApplicationSets only. Created after the Namespace
+    # (and therefore after the AppProject) via the references below.
+    - id: tenantAdminRole
+      includeWhen:
+        - ${schema.spec.adminGroup != ""}
+      template:
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: Role
+        metadata:
+          name: argocd-tenant-admin
+          namespace: ${tenantNamespace.metadata.name}
+          labels:
+            indstri.com/tenant: ${schema.spec.tenant}
+        rules:
+          - apiGroups: ["argoproj.io"]
+            resources: ["applications", "applicationsets"]
+            verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+    - id: tenantAdminBinding
+      includeWhen:
+        - ${schema.spec.adminGroup != ""}
+      template:
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: RoleBinding
+        metadata:
+          name: argocd-tenant-admin
+          namespace: ${tenantNamespace.metadata.name}
+          labels:
+            indstri.com/tenant: ${schema.spec.tenant}
+        roleRef:
+          apiGroup: rbac.authorization.k8s.io
+          kind: Role
+          name: ${tenantAdminRole.metadata.name}
+        subjects:
+          - apiGroup: rbac.authorization.k8s.io
+            kind: Group
+            name: ${schema.spec.adminGroup}
