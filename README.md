@@ -8,12 +8,14 @@ Three ResourceGraphDefinitions that onboard an Argo CD tenant end to end:
 | `rgd-argocd-tenant-repo.yaml` | `ArgoCDTenantRepo` (one per repo / cred template) | VaultStaticSecret → project-scoped Argo CD repository secret |
 | `rgd-argocd-tenant-cluster.yaml` | `ArgoCDTenantCluster` (one per external cluster) | plain Secret (eks/aks) or VaultStaticSecret (generic) → project-scoped Argo CD cluster secret |
 
-Plus `platform-policies.yaml`, applied once — four Kyverno
-`ValidatingPolicy` resources (`policies.kyverno.io/v1alpha1`, Kyverno
-1.14+, pure CEL): project-binding enforcement for apps/appsets in tenant
-namespaces, the AppProject sourceNamespaces invariant, the
-system-namespace destination guard, and the cross-tenant namespace-claim
-registry (via `resource.List`).
+Plus `platform-policies.yaml`, applied once — six Kyverno
+`ValidatingPolicy` resources (`policies.kyverno.io/v1`, verified on
+Kyverno v1.18, pure CEL): project-binding enforcement for apps/appsets
+in tenant namespaces, the AppProject sourceNamespaces invariant, the
+destination guard (shape + denylist + per-item field rules), the
+cross-tenant namespace-claim registry (via `resource.List`), and
+cross-field guards for the repo and cluster kinds (rules KRO's
+marker-only schema can't express).
 
 Multiple RGDs because KRO cannot fan a resource template out over a list —
 a tenant with N repos/clusters is N instances, not one instance with a
@@ -140,6 +142,13 @@ comes from `platform-policies.yaml` at admission:
   instead of relying on a denylist keeping up. Namespaces that don't
   exist yet are claimable; the denylist remains as the belt for external
   clusters, which the hub can't inspect.
+- **`tenant-*` is a reserved namespace prefix**: every namespace named
+  `tenant-*` must carry `indstri.com/tenant` equal to its name suffix
+  (the RGD-created ones do). This closes the gap where an unlabeled
+  `tenant-*` namespace would evade the label-matched project-binding
+  policy — but it also means the platform must not name unrelated infra
+  `tenant-...` (the Argo CD apps-in-any-namespace glob claims that space
+  regardless).
 - **Race detector**: admission checks read Kyverno's informer cache, so
   two near-simultaneous writes can both pass. The claims policy also runs
   in background mode — a conflict that slips through a race shows up in
@@ -187,22 +196,32 @@ AppProject lists.
 - `provider: aks` requires the `aks:` block to be present (`aks: {}` for
   defaults).
 - The tenant Namespace is cluster-scoped while the `ArgoCDTenant`
-  instance is namespaced; Kubernetes GC doesn't honor cross-scope
-  ownership, so verify on your KRO version whether the Namespace is
-  cleaned up on instance deletion — if not, offboarding must delete
-  `tenant-<tenant>` explicitly.
-- Kyverno 1.14+ for `ValidatingPolicy` (`policies.kyverno.io/v1alpha1`);
-  the claims policy uses the Kyverno CEL `resource.List` library, so it
-  runs in the Kyverno engine rather than compiling to a native
-  ValidatingAdmissionPolicy.
+  instance is namespaced. Verified on KRO v0.9.2: KRO tracks resources
+  via applysets (not ownerReferences), and the Namespace IS deleted when
+  the instance is deleted.
+- Kyverno `ValidatingPolicy` at `policies.kyverno.io/v1` (verified on
+  Kyverno v1.18; v1alpha1 is deprecated). The claims policy uses the
+  Kyverno CEL `resource.List` library, so it runs in the Kyverno engine
+  rather than compiling to a native ValidatingAdmissionPolicy. Kyverno
+  CEL quirks handled in the policies: `variables.*` are typed `any` and
+  need `dyn()` casts before comprehensions; every policy carries a
+  `not-being-deleted` matchCondition so finalizer-removal updates on
+  already-invalid objects don't deadlock deletion; and the
+  ArgoCDTenantRepo plural is `argocdtenantrepoes` (KRO's pluralizer).
 - The RGD labels the derived tenant namespace `indstri.com/tenant`;
   `extraSourceNamespaces` must be given the same label at approval time
   or the project-binding policy won't cover them (Argo CD's own
   sourceNamespaces check still applies either way).
-- Verify against your versions: KRO simple-schema `validation` block
-  (CEL over `self`) and `status` projections; destinations-by-name
-  requires the local cluster to be reachable as `in-cluster` (default in
-  current Argo CD).
+- KRO v0.9.2 verified (KIND): simple schema supports **field markers
+  only** (`required`, `default`, `enum`, `pattern`, `minItems`, …) — no
+  CEL `validation` block, so cross-field rules live in
+  `platform-policies.yaml`; RGD `status` fields may only reference
+  resources, not `schema`, so the repo/cluster RGDs expose no custom
+  status (their output names are deterministic). Template CEL
+  (`map`/`filter`/list concat, ternaries, `has()`) compiles and
+  reconciles correctly.
+- Destinations-by-name requires the local cluster to be reachable as
+  `in-cluster` (default in current Argo CD).
 
 ## Apply
 
@@ -214,19 +233,72 @@ kubectl apply -f rgd-argocd-tenant.yaml \
               -f rgd-argocd-tenant-repo.yaml \
               -f rgd-argocd-tenant-cluster.yaml
 kubectl wait --for condition=established \
-  crd/argocdtenants.kro.run crd/argocdtenantclusters.kro.run
+  crd/argocdtenants.kro.run crd/argocdtenantclusters.kro.run \
+  crd/argocdtenantrepoes.kro.run   # note KRO's plural: repoES
 kubectl apply -f platform-policies.yaml
+bash tests/preflight.sh            # HARD GATE — see below
 kubectl apply -f examples/tenant-payments.yaml   # sample tenant
 ```
 
-Note the claims policy fails closed: if Kyverno can't list
-`argocdtenants`, tenant creates/updates are denied, not silently
-allowed. The ClusterRole in `platform-policies.yaml` aggregates into
-`kyverno:admission-controller` via
-`rbac.kyverno.io/aggregate-to-admission-controller: "true"` (Kyverno
-1.11+; the `app.kubernetes.io/*` labels cover older charts). Verify with:
+**Preflight is a hard gate, not advice.** All policies except
+`argocd-tenant-project-binding` are `failurePolicy: Fail`, and the
+claims/appproject/field-guard policies `resource.List` the kro.run kinds
+and namespaces via an aggregated ClusterRole. If that aggregation didn't
+take (Kyverno chart labels differ from the assumed
+`app.kubernetes.io/instance=kyverno`), the lookups fail and tenant writes
+are denied with an opaque error mid-onboarding. `tests/preflight.sh`
+fails the rollout unless both the admission and reports controllers can
+list `argocdtenants`, `argocdtenantclusters`, `argocdtenantrepoes`, and
+`namespaces`, and all six policies report `READY=true`. Run it after
+every policy apply. The ClusterRole aggregates via
+`rbac.kyverno.io/aggregate-to-admission-controller|reports-controller`
+(Kyverno 1.11+; `app.kubernetes.io/*` labels cover older charts) — if
+preflight fails, that label set is the first thing to check.
 
-```sh
-kubectl auth can-i list argocdtenants.kro.run \
-  --as system:serviceaccount:kyverno:kyverno-admission-controller
-```
+### Availability note (prod)
+
+`argocd-tenant-project-binding` is deliberately `failurePolicy: Ignore`:
+it matches every Application/ApplicationSet write in a tenant namespace,
+and Argo CD's own `sourceNamespaces` check is the hard enforcer, so a
+Kyverno outage must not block tenant app deploys. Every other policy is
+`Fail` (fail-closed) because it IS the boundary — run Kyverno's admission
+controller HA (≥2 replicas) so those policies aren't a single point of
+failure for onboarding.
+
+## Day-2 operations
+
+- **Renames are blocked, not silent data-loss.** `ArgoCDTenant.spec.tenant`
+  and the `spec.tenant`/`spec.name` of repos/clusters are the objects'
+  identities — they name the AppProject, the `tenant-<tenant>` namespace,
+  and the Argo CD secrets. Editing them would make KRO's applyset prune
+  the old-named resources (cascade-deleting the tenant's workloads) and
+  create empty new ones, so admission policies reject the change. To
+  "rename", delete and recreate. (`spec.server` on a cluster is likewise
+  immutable.)
+- **Offboarding order — children first.** Deleting an `ArgoCDTenant` does
+  not cascade to its separately-managed repo/cluster instances, so the
+  referential guard denies deleting a tenant while any `ArgoCDTenantRepo`
+  or `ArgoCDTenantCluster` of that tenant still exists (otherwise their
+  Vault-synced credential secrets would be orphaned). Teardown:
+
+  ```sh
+  kubectl delete argocdtenantrepoes,argocdtenantclusters \
+    -n argocd -l indstri.com/tenant=<tenant>
+  kubectl delete argocdtenant <tenant> -n argocd
+  ```
+
+- **Deleting a cluster a tenant still references** is allowed (guarding it
+  would deadlock against the rule above). It leaves that tenant's
+  `destinations` entry dangling until you remove it — apps targeting it
+  fail, but there's no cross-tenant risk: the `<tenant>-<name>` naming
+  rule means only the same tenant can ever re-register that name. Drop the
+  destination from the tenant, or re-register the cluster.
+- **Changing a claim.** Removing a `destinations` entry releases the
+  namespace claim but does not delete the namespace on the target cluster
+  (Argo CD created it via `CreateNamespace`); clean it up out of band if
+  needed.
+- **Applying policy updates to a live cluster** is safe: the
+  `create-or-spec-changed` matchConditions mean KRO's reconcile
+  (metadata-only main-resource applies) won't re-deny grandfathered
+  instances, and background eval reports pre-existing violations in
+  PolicyReports rather than blocking.

@@ -65,8 +65,11 @@ spec:
   name: prod-east
   provider: eks
   server: https://ABC123.gr7.us-east-1.eks.amazonaws.com
-  # Cluster CA bundle (aws eks describe-cluster --query cluster.certificateAuthority.data)
-  caData: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tRVhBTVBMRQ==
+  # PLACEHOLDER — decodes to "REPLACE-WITH-REAL-CA". Real value:
+  #   aws eks describe-cluster --name <cluster> \
+  #     --query cluster.certificateAuthority.data --output text
+  # (any base64 passes validation, so this WILL fail TLS if shipped as-is)
+  caData: UkVQTEFDRS1XSVRILVJFQUwtQ0E=
   eks:
     clusterName: payments-prod-east
     roleARN: arn:aws:iam::123456789012:role/argocd-deployer-payments

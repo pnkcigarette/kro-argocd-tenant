@@ -1,35 +1,70 @@
 ---
 # Platform-level guardrails, applied once (not per tenant).
-# Kyverno >= 1.14 ValidatingPolicy (policies.kyverno.io/v1alpha1) — the
-# Kubernetes ValidatingAdmissionPolicy CEL spec plus Kyverno's CEL
-# libraries (resource.List for the claim registry).
+# Kyverno ValidatingPolicy (policies.kyverno.io/v1, verified on Kyverno
+# v1.18) — the Kubernetes ValidatingAdmissionPolicy CEL spec plus
+# Kyverno's CEL libraries (resource.List for the claim registry).
 #
-#   argocd-tenant-project-binding     — apps/appsets in tenant namespaces
-#                                       must bind to the tenant's project
-#                                       (replaces the per-tenant
-#                                       ClusterPolicy the RGD used to emit)
-#   argocd-appproject-guard           — sourceNamespaces invariant on all
-#                                       AppProjects
-#   argocd-tenant-destination-guard   — no system / other-tenant namespaces
-#                                       in ArgoCDTenant destinations
-#   argocd-tenant-claims              — cross-tenant uniqueness of
-#                                       destination + source namespace
-#                                       claims, first-come-first-claim
+# Kyverno CEL gotchas (verified live):
+#   - variables.* are typed 'any'; wrap in dyn() before comprehensions
+#   - every policy carries a not-being-deleted matchCondition, or
+#     finalizer-removal UPDATEs on invalid objects deadlock deletion
+#   - the ArgoCDTenantRepo CRD plural is "argocdtenantrepoes" (KRO's
+#     pluralizer), not "argocdtenantrepos"
 #
-# The claims policy needs Kyverno's admission controller to be able to
-# list argocdtenants — the aggregated ClusterRole at the bottom grants it.
+#   argocd-tenant-project-binding      — apps/appsets in tenant namespaces
+#                                        must bind to the tenant's project
+#                                        (failurePolicy Ignore: Argo CD
+#                                        sourceNamespaces is the hard
+#                                        enforcer; this is the early error)
+#   argocd-appproject-guard            — sourceNamespaces invariant on all
+#                                        AppProjects, bound to the label
+#   argocd-tenant-namespace-guard      — tenant-* namespaces must carry the
+#                                        matching indstri.com/tenant label
+#   argocd-tenant-destination-guard    — no system / other-tenant namespaces
+#                                        + per-item field rules
+#   argocd-tenant-claims               — cross-tenant uniqueness of
+#                                        destination + source namespace
+#                                        claims, first-come-first-claim
+#   argocd-tenant-repo-field-guard     — repo cross-field + dup +
+#                                        identity-immutable rules
+#   argocd-tenant-cluster-field-guard  — cluster cross-field + dup +
+#                                        server/identity-immutable rules
+#   argocd-tenant-referential-guard    — DELETE-time referential integrity
+#                                        (offboarding order), failurePolicy
+#                                        Ignore
+#
+# The claims/appproject/field-guard policies need Kyverno's controllers to
+# list the kro.run kinds + namespaces — the aggregated ClusterRole at the
+# bottom grants it. All policies EXCEPT project-binding are failurePolicy
+# Fail (fail closed); see the ordering/RBAC preflight in the README.
 
 # Defense-in-depth for the Argo CD binding rule, and a readable failure
 # at admission instead of an app stuck in an error state. Matches by the
 # indstri.com/tenant namespace label (the RGD labels the derived
 # namespace; label any extraSourceNamespaces at approval time).
-apiVersion: policies.kyverno.io/v1alpha1
+#
+# failurePolicy: Ignore (NOT Fail) — this policy matches every
+# Application/ApplicationSet write in a tenant namespace, the hottest
+# admission path in the system. Argo CD's own sourceNamespaces check is
+# the HARD enforcer (an app in tenant-X can only bind project X), so if
+# Kyverno is unavailable we lose only the early, readable error, not the
+# security boundary. Keeping this Fail would put Kyverno in the critical
+# path of every tenant app deploy. Every OTHER policy here stays Fail:
+# those ARE the boundary and must fail closed.
+apiVersion: policies.kyverno.io/v1
 kind: ValidatingPolicy
 metadata:
   name: argocd-tenant-project-binding
 spec:
   validationActions: [Deny]
-  failurePolicy: Fail
+  failurePolicy: Ignore
+  matchConditions:
+    # Never block the deletion path: finalizer removal is an UPDATE on an
+    # object that may already violate current policy (it predates it, or
+    # is being cleaned up precisely because it is bad). Without this,
+    # KRO's finalizer removal deadlocks against the policy.
+    - name: not-being-deleted
+      expression: '!has(object.metadata.deletionTimestamp)'
   matchConstraints:
     namespaceSelector:
       matchExpressions:
@@ -64,13 +99,31 @@ spec:
 #     namespaces, never wildcards
 #   - every other AppProject (platform, legacy, default) must not use
 #     '*' or cover tenant namespaces at all
-apiVersion: policies.kyverno.io/v1alpha1
+apiVersion: policies.kyverno.io/v1
 kind: ValidatingPolicy
 metadata:
   name: argocd-appproject-guard
 spec:
   validationActions: [Deny]
   failurePolicy: Fail
+  matchConditions:
+    # Never block the deletion path: finalizer removal is an UPDATE on an
+    # object that may already violate current policy (it predates it, or
+    # is being cleaned up precisely because it is bad). Without this,
+    # KRO's finalizer removal deadlocks against the policy.
+    - name: not-being-deleted
+      expression: '!has(object.metadata.deletionTimestamp)'
+    # Skip re-validation on a no-op UPDATE — KRO's labeller applies to the
+    # main resource on reconcile, which would otherwise re-run these rules
+    # and deny any grandfathered AppProject that predates them. This guard
+    # ALSO reads metadata.labels (indstri.com/tenant), so it must re-run
+    # on a label change too — otherwise a label-only edit bypasses the
+    # label-binding rule. A stable KRO relabel (no actual change) is still
+    # skipped; only a real spec-or-label change re-validates.
+    - name: create-or-spec-or-label-changed
+      expression: >-
+        request.operation == 'CREATE' || object.spec != oldObject.spec ||
+        object.metadata.labels != oldObject.metadata.labels
   matchConstraints:
     resourceRules:
       - apiGroups: ["argoproj.io"]
@@ -84,6 +137,9 @@ spec:
     - name: sourceNamespaces
       expression: >-
         has(object.spec.sourceNamespaces) ? object.spec.sourceNamespaces : []
+    - name: tenants
+      expression: >-
+        resource.List("kro.run/v1alpha1", "argocdtenants", "").items
   validations:
     # sourceNamespaces entries are GLOBS ('t*', '*ant-*', '[t]enant-x'
     # all match tenant namespaces without literally starting with
@@ -102,17 +158,102 @@ spec:
       message: >-
         only RGD-managed tenant AppProjects may list tenant-* source
         namespaces; other AppProjects must not cover tenant namespaces
+    # Bind a labeled project's namespaces to the tenant in its OWN label:
+    # each ns must be the tenant's derived namespace or a declared extra
+    # of the matching ArgoCDTenant. Without this, any labeled AppProject
+    # could list another tenant's namespace and break the
+    # one-project-per-namespace invariant from the platform side.
+    #
+    # The derived-namespace branch (tenant-<label>) needs no instance
+    # lookup, so an RGD-managed project listing only its own derived
+    # namespace is admitted even before Kyverno's argocdtenants informer
+    # has caught the instance from the same graph — avoiding a reconcile
+    # deadlock on fresh onboarding. Only projects listing EXTRAS depend
+    # on the instance being listable, and those extras were already
+    # validated on the ArgoCDTenant at its own admission.
+    - expression: >-
+        !variables.isTenantProject ||
+        dyn(variables.sourceNamespaces).all(ns,
+          ns == 'tenant-' + object.metadata.labels['indstri.com/tenant'] ||
+          dyn(variables.tenants).exists(t,
+            t.spec.tenant == object.metadata.labels['indstri.com/tenant'] &&
+            has(t.spec.extraSourceNamespaces) && ns in t.spec.extraSourceNamespaces))
+      message: >-
+        a tenant AppProject may only list namespaces belonging to the
+        tenant in its indstri.com/tenant label
+---
+# Protect the tenant-namespace boundary itself. The project-binding
+# policy only matches namespaces carrying indstri.com/tenant, and Argo CD
+# watches every namespace in the tenant-* glob — so a tenant-* namespace
+# WITHOUT the label (created manually, or with the label later stripped)
+# would evade project-binding entirely, backstopped only by Argo CD's
+# sourceNamespaces. This closes that gap at the namespace itself:
+#   - any namespace named tenant-* must carry
+#     indstri.com/tenant == <suffix-after "tenant-">
+#   - that binds the label to the name, so it can't be mislabeled, and an
+#     UPDATE that drops/changes the label is rejected
+# The RGD-created namespace already satisfies this (name tenant-<t>,
+# label <t>), so legitimate onboarding is unaffected.
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: argocd-tenant-namespace-guard
+spec:
+  validationActions: [Deny]
+  failurePolicy: Fail
+  # Background eval surfaces a tenant-* namespace that was mislabeled or
+  # lost its label before this policy existed (admission only sees new
+  # writes). No spec-change gate here: this validates metadata.labels
+  # (which KRO maintains correctly), not spec, so a KRO metadata apply
+  # re-affirms the required label rather than tripping the rule.
+  evaluation:
+    admission:
+      enabled: true
+    background:
+      enabled: true
+  matchConditions:
+    - name: not-being-deleted
+      expression: '!has(object.metadata.deletionTimestamp)'
+    # Only tenant-* namespaces are in scope.
+    - name: is-tenant-namespace
+      expression: "object.metadata.name.startsWith('tenant-')"
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["namespaces"]
+  validations:
+    - expression: >-
+        has(object.metadata.labels) &&
+        'indstri.com/tenant' in object.metadata.labels &&
+        object.metadata.labels['indstri.com/tenant'] == object.metadata.name.substring(7)
+      message: >-
+        a tenant-* namespace must carry indstri.com/tenant equal to the
+        name after "tenant-" (create tenant namespaces via an
+        ArgoCDTenant, and do not remove the label)
 ---
 # Destinations must never target platform/system namespaces, or another
 # tenant's app namespace. Deploying into their OWN app namespace
 # (tenant-<tenant>) is allowed.
-apiVersion: policies.kyverno.io/v1alpha1
+apiVersion: policies.kyverno.io/v1
 kind: ValidatingPolicy
 metadata:
   name: argocd-tenant-destination-guard
 spec:
   validationActions: [Deny]
   failurePolicy: Fail
+  matchConditions:
+    # Never block the deletion path: finalizer removal is an UPDATE on an
+    # object that may already violate current policy (it predates it, or
+    # is being cleaned up precisely because it is bad). Without this,
+    # KRO's finalizer removal deadlocks against the policy.
+    - name: not-being-deleted
+      expression: '!has(object.metadata.deletionTimestamp)'
+    # Skip re-validation on a spec-unchanged UPDATE (KRO labeller applies
+    # metadata to the main resource on reconcile).
+    - name: create-or-spec-changed
+      expression: "request.operation == 'CREATE' || object.spec != oldObject.spec"
   matchConstraints:
     resourceRules:
       - apiGroups: ["kro.run"]
@@ -120,14 +261,61 @@ spec:
         operations: ["CREATE", "UPDATE"]
         resources: ["argocdtenants"]
   validations:
+    # spec.tenant is the object's IDENTITY — it names the AppProject and
+    # the tenant-<tenant> namespace. Renaming it makes KRO's applyset
+    # prune the old-named AppProject and namespace (cascade-deleting the
+    # tenant's workloads) and create fresh empty ones. Immutable, like
+    # cluster.spec.server.
+    - expression: >-
+        request.operation != 'UPDATE' || object.spec.tenant == oldObject.spec.tenant
+      message: >-
+        ArgoCDTenant.spec.tenant is immutable (renaming would delete the
+        tenant's namespace and AppProject) — delete and recreate instead
     # Friendly shape error first; the rules below filter to well-formed
     # entries so a malformed instance gets this message instead of a CEL
     # index error (KRO's schema validation may not be enforced at the
     # API server, so admission cannot assume shape).
+    # Metacharacter set matches the appproject-guard's sourceNamespaces
+    # rule: Argo CD destination namespaces are globs, so '[' must be
+    # rejected too, or 'pay-[ab]' claims pay-a/pay-b without the
+    # literal-string claim registry ever seeing the overlap.
     - expression: >-
         (has(object.spec.destinations) ? object.spec.destinations : [])
-          .all(d, d.split('/').size() == 2 && d.split('/')[0] != '' && d.split('/')[1] != '')
-      message: destinations must be "<clusterName>/<namespace>"
+          .all(d, d.split('/').size() == 2 && d.split('/')[0] != '' && d.split('/')[1] != ''
+                  && !d.contains('*') && !d.contains('?') && !d.contains('['))
+      message: >-
+        destinations must be "<clusterName>/<namespace>" — explicit
+        namespace claims, no glob metacharacters
+    # Fast self-consistency check; exact cluster ownership (including
+    # hyphen-prefix collisions between tenant names) is verified against
+    # ArgoCDTenantCluster instances in argocd-tenant-claims.
+    - expression: >-
+        (has(object.spec.destinations) ? object.spec.destinations : [])
+          .filter(d, d.split('/').size() == 2)
+          .all(d, d.split('/')[0] == 'in-cluster' ||
+                  d.split('/')[0].startsWith(object.spec.tenant + '-'))
+      message: >-
+        destination cluster must be in-cluster or one of this tenant's
+        clusters (<tenant>-<name>)
+    # Metacharacter set matches the appproject-guard exactly — an extra
+    # admitted here but denied there would wedge the tenant at reconcile.
+    - expression: >-
+        (has(object.spec.extraSourceNamespaces) ? object.spec.extraSourceNamespaces : [])
+          .all(ns, ns.startsWith('tenant-') &&
+               !ns.contains('*') && !ns.contains('?') && !ns.contains('['))
+      message: >-
+        extraSourceNamespaces must start with tenant- (no glob
+        metacharacters) so they are covered by the Argo CD
+        apps-in-any-namespace glob
+    - expression: >-
+        (has(object.spec.sourceRepos) ? object.spec.sourceRepos : [])
+          .all(r, r.startsWith('https://') || r.startsWith('git@') ||
+                  r.startsWith('ssh://') || r.startsWith('oci://'))
+      message: sourceRepos entries must be https://, git@, ssh://, or oci:// URLs/globs
+    - expression: >-
+        (has(object.spec.clusterResourceWhitelist) ? object.spec.clusterResourceWhitelist : [])
+          .all(gk, gk.split('/').size() == 2 && gk.split('/')[1] != '')
+      message: clusterResourceWhitelist entries must be "group/Kind" (empty group as "/Kind")
     # Denylist belt for ALL clusters (external ones can't be inspected
     # from the hub). The positive-claim check for in-cluster namespaces
     # lives in argocd-tenant-claims.
@@ -166,7 +354,7 @@ spec:
 # informer cache), so background evaluation is enabled as the detector:
 # a claim conflict that slips through a race surfaces in PolicyReports
 # on the next background scan.
-apiVersion: policies.kyverno.io/v1alpha1
+apiVersion: policies.kyverno.io/v1
 kind: ValidatingPolicy
 metadata:
   name: argocd-tenant-claims
@@ -178,6 +366,19 @@ spec:
       enabled: true
     background:
       enabled: true
+  matchConditions:
+    # Never block the deletion path: finalizer removal is an UPDATE on an
+    # object that may already violate current policy (it predates it, or
+    # is being cleaned up precisely because it is bad). Without this,
+    # KRO's finalizer removal deadlocks against the policy.
+    - name: not-being-deleted
+      expression: '!has(object.metadata.deletionTimestamp)'
+    # Skip re-validation on a spec-unchanged UPDATE (KRO labeller applies
+    # metadata to the main resource on reconcile). Claim checks depend on
+    # spec.destinations/extraSourceNamespaces, so a metadata-only apply
+    # needs no re-check.
+    - name: create-or-spec-changed
+      expression: "request.operation == 'CREATE' || object.spec != oldObject.spec"
   matchConstraints:
     resourceRules:
       - apiGroups: ["kro.run"]
@@ -188,9 +389,12 @@ spec:
     - name: allTenants
       expression: >-
         resource.List("kro.run/v1alpha1", "argocdtenants", "").items
+    # NOTE: variables.* references are typed 'any' in Kyverno's CEL
+    # compiler; dyn() casts are required before using them as
+    # comprehension ranges (filter/map/exists/all).
     - name: otherTenants
       expression: >-
-        variables.allTenants.filter(t, t.spec.tenant != object.spec.tenant)
+        dyn(variables.allTenants).filter(t, t.spec.tenant != object.spec.tenant)
     - name: clusterList
       expression: >-
         resource.List("kro.run/v1alpha1", "argocdtenantclusters", "").items
@@ -203,15 +407,18 @@ spec:
       expression: >-
         (has(object.spec.destinations) ? object.spec.destinations : [])
           .filter(d, d.split('/').size() == 2)
-    # Canonical claim strings: "<server-or-name>|<namespace>".
+    # Canonical claim strings: "<server-or-name>|<namespace>". The server
+    # is lowercased (DNS is case-insensitive, so ABC123... and abc123...
+    # are the same host); the RGD pattern already forbids trailing-slash
+    # /path variants, so lowercasing is the remaining normalization.
     - name: requestedClaims
       expression: >-
-        variables.requestedDests.map(d,
+        dyn(variables.requestedDests).map(d,
           (d.split('/')[0] == 'in-cluster'
             ? 'https://kubernetes.default.svc'
-            : (variables.clusterList.exists(c, c.spec.tenant + '-' + c.spec.name == d.split('/')[0])
-                ? variables.clusterList.filter(c, c.spec.tenant + '-' + c.spec.name == d.split('/')[0])[0].spec.server
-                : d.split('/')[0]))
+            : (dyn(variables.clusterList).exists(c, c.spec.tenant + '-' + c.spec.name == d.split('/')[0])
+                ? dyn(variables.clusterList).filter(c, c.spec.tenant + '-' + c.spec.name == d.split('/')[0])[0].spec.server
+                : d.split('/')[0])).lowerAscii()
           + '|' + d.split('/')[1])
     - name: requestedSourceNs
       expression: >-
@@ -223,7 +430,7 @@ spec:
     # below (they compare by tenant) and would fight over the same
     # AppProject and namespace.
     - expression: >-
-        !variables.allTenants.exists(t,
+        !dyn(variables.allTenants).exists(t,
           t.spec.tenant == object.spec.tenant &&
           (t.metadata.name != object.metadata.name ||
            t.metadata.namespace != object.metadata.namespace))
@@ -234,29 +441,30 @@ spec:
     # destinations are has()-guarded and shape-filtered: one malformed
     # legacy instance must not error out everyone else's admission.
     - expression: >-
-        !variables.requestedClaims.exists(rc,
-          variables.otherTenants.exists(t,
+        !dyn(variables.requestedClaims).exists(rc,
+          dyn(variables.otherTenants).exists(t,
             (has(t.spec.destinations) ? t.spec.destinations : [])
               .filter(od, od.split('/').size() == 2)
               .exists(od,
                 ((od.split('/')[0] == 'in-cluster'
                   ? 'https://kubernetes.default.svc'
-                  : (variables.clusterList.exists(c, c.spec.tenant + '-' + c.spec.name == od.split('/')[0])
-                      ? variables.clusterList.filter(c, c.spec.tenant + '-' + c.spec.name == od.split('/')[0])[0].spec.server
-                      : od.split('/')[0]))
+                  : (dyn(variables.clusterList).exists(c, c.spec.tenant + '-' + c.spec.name == od.split('/')[0])
+                      ? dyn(variables.clusterList).filter(c, c.spec.tenant + '-' + c.spec.name == od.split('/')[0])[0].spec.server
+                      : od.split('/')[0])).lowerAscii()
                 + '|' + od.split('/')[1]) == rc)))
       message: >-
         one or more destination namespaces are already claimed by another
-        tenant (clusters are compared by server URL, so registering the
-        same cluster under a different name does not evade the claim)
+        tenant (clusters are compared by normalized server URL, so
+        registering the same cluster under a different name or URL-case
+        does not evade the claim)
     # Exact cluster ownership: a destination may only reference in-cluster
     # or a cluster registered by an ArgoCDTenantCluster of THIS tenant.
     # The RGD's startsWith(tenant + '-') check alone is bypassable when
     # one tenant name is a hyphen-prefix of another (tenant "payments"
     # matching cluster "payments-eu-prod" of tenant "payments-eu").
     - expression: >-
-        !variables.requestedDests.exists(d,
-          variables.clusterList.exists(c,
+        !dyn(variables.requestedDests).exists(d,
+          dyn(variables.clusterList).exists(c,
             c.spec.tenant != object.spec.tenant &&
             d.split('/')[0] == c.spec.tenant + '-' + c.spec.name))
       message: >-
@@ -271,12 +479,12 @@ spec:
     # claim). External clusters can't be inspected from the hub; the
     # denylist in argocd-tenant-destination-guard still covers those.
     - expression: >-
-        variables.requestedDests
+        dyn(variables.requestedDests)
           .filter(d, d.split('/')[0] == 'in-cluster')
           .all(d,
             d.split('/')[1] == 'tenant-' + object.spec.tenant ||
-            !variables.hubNamespaces.exists(n, n.metadata.name == d.split('/')[1]) ||
-            variables.hubNamespaces.exists(n,
+            !dyn(variables.hubNamespaces).exists(n, n.metadata.name == d.split('/')[1]) ||
+            dyn(variables.hubNamespaces).exists(n,
               n.metadata.name == d.split('/')[1] &&
               has(n.metadata.labels) && (
                 ('indstri.com/tenant' in n.metadata.labels &&
@@ -287,13 +495,264 @@ spec:
         an existing in-cluster destination namespace must belong to this
         tenant or be labeled indstri.com/tenant-deployable="true"
     - expression: >-
-        !variables.requestedSourceNs.exists(ns,
-          variables.otherTenants.exists(t,
+        !dyn(variables.requestedSourceNs).exists(ns,
+          dyn(variables.otherTenants).exists(t,
             ns == 'tenant-' + t.spec.tenant ||
             (has(t.spec.extraSourceNamespaces) && ns in t.spec.extraSourceNamespaces)))
       message: >-
         one or more source namespaces (derived or extra) are already
         claimed by another tenant
+---
+# Cross-field rules for ArgoCDTenantRepo — KRO simple schema has no CEL
+# validation block, so scheme/credType agreement lives here.
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: argocd-tenant-repo-field-guard
+spec:
+  validationActions: [Deny]
+  failurePolicy: Fail
+  # Background eval surfaces duplicate (tenant,name) instances that
+  # predate the dup rule (or slipped in while the webhook was down) in
+  # PolicyReports — admission only catches new writes.
+  evaluation:
+    admission:
+      enabled: true
+    background:
+      enabled: true
+  matchConditions:
+    # Never block the deletion path: finalizer removal is an UPDATE on an
+    # object that may already violate current policy (it predates it, or
+    # is being cleaned up precisely because it is bad). Without this,
+    # KRO's finalizer removal deadlocks against the policy.
+    - name: not-being-deleted
+      expression: '!has(object.metadata.deletionTimestamp)'
+    # Skip re-validation on a spec-unchanged UPDATE — KRO's labeller
+    # applies metadata to the main resource on reconcile, which would
+    # otherwise re-run these rules and deny any grandfathered repo (e.g.
+    # a vault-less one) that predates them.
+    - name: create-or-spec-changed
+      expression: "request.operation == 'CREATE' || object.spec != oldObject.spec"
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["kro.run"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["argocdtenantrepoes"]
+  variables:
+    - name: repoList
+      expression: >-
+        resource.List("kro.run/v1alpha1", "argocdtenantrepoes", "").items
+  validations:
+    # tenant+name are the identity: they name the Argo CD Secret
+    # (repo-<tenant>-<name>) and the Vault path. Renaming orphans the old
+    # secret and re-syncs from a different Vault path. Immutable.
+    - expression: >-
+        request.operation != 'UPDATE' ||
+        (object.spec.tenant == oldObject.spec.tenant && object.spec.name == oldObject.spec.name)
+      message: >-
+        ArgoCDTenantRepo spec.tenant/spec.name are immutable (renaming
+        orphans the repo secret) — delete and recreate instead
+    # The vault block itself must be present — nested required= markers
+    # only apply when the parent object exists, so KRO admits a
+    # vault-less instance that then wedges at reconcile.
+    - expression: >-
+        has(object.spec.vault) && object.spec.vault.namespace != ''
+      message: vault.namespace (the tenant's Vault namespace) is required
+    # One instance per (tenant, name): duplicates are both admitted by
+    # KRO but fight over the same output Secret at the applyset level.
+    - expression: >-
+        !dyn(variables.repoList).exists(r,
+          r.spec.tenant == object.spec.tenant && r.spec.name == object.spec.name &&
+          (r.metadata.name != object.metadata.name ||
+           r.metadata.namespace != object.metadata.namespace))
+      message: another ArgoCDTenantRepo instance already defines this tenant/name
+    - expression: >-
+        object.spec.credType != 'https' ||
+        object.spec.url.startsWith('https://') || object.spec.url.startsWith('oci://')
+      message: credType=https requires an https:// (or oci://) url
+    - expression: >-
+        object.spec.credType != 'ssh' ||
+        object.spec.url.startsWith('git@') || object.spec.url.startsWith('ssh://')
+      message: credType=ssh requires a git@ or ssh:// url
+    - expression: >-
+        !object.spec.url.startsWith('oci://') ||
+        (object.spec.repoType == 'helm' && object.spec.enableOCI)
+      message: oci:// urls require repoType=helm and enableOCI=true
+    - expression: >-
+        !object.spec.enableOCI || object.spec.repoType == 'helm'
+      message: enableOCI only applies to repoType=helm
+---
+# Cross-field rules for ArgoCDTenantCluster — provider/block agreement
+# that KRO field markers cannot express.
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: argocd-tenant-cluster-field-guard
+spec:
+  validationActions: [Deny]
+  failurePolicy: Fail
+  # Background eval surfaces duplicate (tenant,name) instances that
+  # predate the dup rule (or slipped in while the webhook was down) in
+  # PolicyReports — admission only catches new writes.
+  evaluation:
+    admission:
+      enabled: true
+    background:
+      enabled: true
+  matchConditions:
+    # Never block the deletion path: finalizer removal is an UPDATE on an
+    # object that may already violate current policy (it predates it, or
+    # is being cleaned up precisely because it is bad). Without this,
+    # KRO's finalizer removal deadlocks against the policy.
+    - name: not-being-deleted
+      expression: '!has(object.metadata.deletionTimestamp)'
+    # Skip structural re-validation on a spec-unchanged UPDATE. KRO's
+    # labeller/applyset managers server-side-APPLY to the MAIN resource
+    # (metadata only) on reconcile — those applies would otherwise re-run
+    # every rule below and DENY any grandfathered instance that predates a
+    # rule, wedging KRO. On CREATE and real spec changes the policy runs
+    # in full. (KRO status writes use the /status subresource and never
+    # reach this webhook.)
+    - name: create-or-spec-changed
+      expression: "request.operation == 'CREATE' || object.spec != oldObject.spec"
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["kro.run"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["argocdtenantclusters"]
+  variables:
+    - name: clusterDupList
+      expression: >-
+        resource.List("kro.run/v1alpha1", "argocdtenantclusters", "").items
+  validations:
+    # tenant+name are the identity: they name the Argo CD cluster Secret
+    # (cluster-<tenant>-<name>) and the registered cluster name
+    # (<tenant>-<name>) that tenant destinations reference. Renaming
+    # orphans the secret and breaks every destination pointing at it.
+    # Immutable (server is separately immutable below).
+    - expression: >-
+        request.operation != 'UPDATE' ||
+        (object.spec.tenant == oldObject.spec.tenant && object.spec.name == oldObject.spec.name)
+      message: >-
+        ArgoCDTenantCluster spec.tenant/spec.name are immutable (renaming
+        orphans the cluster secret and breaks referencing destinations) —
+        delete and recreate instead
+    # server must be host:port only (no trailing slash or path). The
+    # claim registry keys on the server string, so 'https://h:6443' and
+    # 'https://h:6443/' would be two claim keys for one physical cluster.
+    # Enforced here (not the RGD pattern) because KRO refuses to tighten
+    # a CRD validation pattern on an existing RGD (breaking-change guard).
+    #
+    # Scoped to CREATE-or-server-changed: server is immutable, so a
+    # grandfathered bad-server cluster can NEVER be corrected in place —
+    # without this scope, every unrelated update (e.g. clusterResources)
+    # would trip this rule and the cluster could only be deleted+recreated.
+    - expression: >-
+        (request.operation == 'UPDATE' && object.spec.server == oldObject.spec.server) ||
+        (object.spec.server.startsWith('https://') &&
+         !object.spec.server.substring(8).contains('/'))
+      message: >-
+        ArgoCDTenantCluster.spec.server must be host:port only (https://,
+        no trailing slash or path) so claim canonicalization can't be
+        aliased by URL format
+    # server is effectively immutable: the claim registry canonicalizes
+    # destinations by server at ArgoCDTenant admission time, so repointing
+    # a cluster's server afterward would retroactively redirect an
+    # approved destination past every claim check. KRO v0.9.2 ignores the
+    # `immutable` schema marker, so it is enforced here on UPDATE.
+    - expression: >-
+        request.operation != 'UPDATE' || object.spec.server == oldObject.spec.server
+      message: >-
+        ArgoCDTenantCluster.spec.server is immutable — delete and
+        re-register to change the target cluster
+    # One instance per (tenant, name): duplicates are both admitted by
+    # KRO but fight over the same cluster secret at the applyset level.
+    - expression: >-
+        !dyn(variables.clusterDupList).exists(c,
+          c.spec.tenant == object.spec.tenant && c.spec.name == object.spec.name &&
+          (c.metadata.name != object.metadata.name ||
+           c.metadata.namespace != object.metadata.namespace))
+      message: another ArgoCDTenantCluster instance already defines this tenant/name
+    # eks/aks API certs chain to the cluster's private CA — without
+    # caData Argo CD fails TLS verification against the endpoint.
+    - expression: >-
+        object.spec.provider == 'generic' ||
+        (has(object.spec.caData) && object.spec.caData != '')
+      message: provider=eks/aks requires caData (base64 CA bundle of the target cluster)
+    - expression: >-
+        object.spec.provider != 'generic' ||
+        !has(object.spec.caData) || object.spec.caData == ''
+      message: caData may only be set for eks/aks (generic carries its CA in the Vault config JSON)
+    - expression: >-
+        object.spec.provider != 'eks' ||
+        (has(object.spec.eks) && object.spec.eks.clusterName != '' && object.spec.eks.roleARN != '')
+      message: provider=eks requires eks.clusterName and eks.roleARN
+    # Unused provider blocks must stay empty — a filled-in block that
+    # will be silently ignored is a misconfiguration.
+    - expression: >-
+        object.spec.provider == 'eks' || !has(object.spec.eks) ||
+        (object.spec.eks.clusterName == '' && object.spec.eks.roleARN == '')
+      message: eks.* may only be set when provider=eks
+    # The aks block must be PRESENT for provider=aks — the template
+    # references aks.environment directly.
+    - expression: >-
+        object.spec.provider != 'aks' || has(object.spec.aks)
+      message: 'provider=aks requires the aks block ("aks: {}" for defaults)'
+    - expression: >-
+        object.spec.provider != 'generic' ||
+        (has(object.spec.vault) && object.spec.vault.namespace != '')
+      message: provider=generic requires vault.namespace (the tenant's Vault namespace)
+    - expression: >-
+        object.spec.provider == 'generic' || !has(object.spec.vault) ||
+        object.spec.vault.namespace == ''
+      message: vault.* may only be set when provider=generic (eks/aks use ambient pod identity)
+---
+# Referential integrity on DELETE (day-2 offboarding). Deleting an
+# ArgoCDTenant does NOT cascade to its separately-managed repo/cluster
+# instances (their Argo CD credential secrets would be orphaned). This
+# guard enforces teardown order: an ArgoCDTenant can't be deleted while
+# any ArgoCDTenantRepo/Cluster of the same tenant still exists — delete
+# the children first.
+#
+# NOT guarded: deleting a cluster a tenant still references. That would
+# deadlock against the rule above (a tenant that owns AND references its
+# cluster couldn't be torn down in either order). It's also low-risk: the
+# <tenant>-<name> naming rule means only the SAME tenant can ever reclaim
+# a freed cluster name, so no cross-tenant hijack — the only residual is
+# the tenant's own dangling destination, resolved by removing it (see the
+# README day-2 runbook). So: delete clusters/repos, then the tenant.
+#
+# On DELETE the admitted object is `oldObject` (`object` is null), so the
+# expressions read oldObject and there is no not-being-deleted condition.
+# failurePolicy Ignore: teardown must not be blocked by a Kyverno outage
+# (orphaning is a hygiene issue, not a security boundary).
+apiVersion: policies.kyverno.io/v1
+kind: ValidatingPolicy
+metadata:
+  name: argocd-tenant-referential-guard
+spec:
+  validationActions: [Deny]
+  failurePolicy: Ignore
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["kro.run"]
+        apiVersions: ["v1alpha1"]
+        operations: ["DELETE"]
+        resources: ["argocdtenants"]
+  variables:
+    - name: repoList
+      expression: resource.List("kro.run/v1alpha1", "argocdtenantrepoes", "").items
+    - name: clusterList
+      expression: resource.List("kro.run/v1alpha1", "argocdtenantclusters", "").items
+  validations:
+    - expression: >-
+        !dyn(variables.repoList).exists(r, r.spec.tenant == oldObject.spec.tenant) &&
+        !dyn(variables.clusterList).exists(c, c.spec.tenant == oldObject.spec.tenant)
+      message: >-
+        delete this tenant's ArgoCDTenantRepo/ArgoCDTenantCluster instances
+        first — deleting the tenant now would orphan their Argo CD secrets
 ---
 # Lets Kyverno run the resource.List lookups in argocd-tenant-claims —
 # the admission controller at admission time, the reports controller for
@@ -313,9 +772,13 @@ metadata:
     app.kubernetes.io/component: admission-controller
 rules:
   - apiGroups: ["kro.run"]
-    resources: ["argocdtenants", "argocdtenantclusters"]
+    resources: ["argocdtenants", "argocdtenantclusters", "argocdtenantrepoes"]
     verbs: ["get", "list", "watch"]
   # For the positive claim check on existing hub namespaces.
   - apiGroups: [""]
     resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
+  # For background report generation on the matched Argo CD kinds.
+  - apiGroups: ["argoproj.io"]
+    resources: ["appprojects", "applications", "applicationsets"]
     verbs: ["get", "list", "watch"]

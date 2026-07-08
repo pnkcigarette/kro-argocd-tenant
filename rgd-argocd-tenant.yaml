@@ -27,7 +27,7 @@ spec:
     spec:
       # Tenant short name. Used as the AppProject name and the value every
       # tenant Application/ApplicationSet must set as spec.project.
-      tenant: string | required=true
+      tenant: string | required=true pattern="^[a-z0-9]([a-z0-9-]{0,28}[a-z0-9])?$"
       description: string | default=""
 
       # Additional namespaces the tenant may create apps/appsets in,
@@ -46,7 +46,7 @@ spec:
       # Cluster names other than in-cluster come from ArgoCDTenantCluster
       # instances (<tenant>-<name>). Applications targeting an external
       # cluster must use destination.name (see README).
-      destinations: '[]string'
+      destinations: '[]string | required=true minItems=1 uniqueItems=true'
 
       # Allowed source repo URLs / globs. Keep in sync with the
       # ArgoCDTenantRepo instances you create for this tenant.
@@ -59,50 +59,12 @@ spec:
       # Cluster-scoped resources the tenant may manage, as "group/Kind"
       # (default: none).
       clusterResourceWhitelist: '[]string'
-    validation:
-      # Optional list fields are guarded with has() throughout: nested
-      # defaulting does not materialize absent fields, and an unguarded
-      # dereference would error instead of validating.
-      - expression: self.tenant.matches('^[a-z0-9]([a-z0-9-]{0,28}[a-z0-9])?$')
-        message: tenant must be a short RFC1123 name (lowercase alphanumeric and '-', max 30 chars)
-      - expression: >-
-          !has(self.extraSourceNamespaces) ||
-          self.extraSourceNamespaces.all(ns, ns.startsWith('tenant-') && !ns.contains('*'))
-        message: >-
-          extraSourceNamespaces must start with tenant- (no wildcards) so
-          they are covered by the Argo CD apps-in-any-namespace glob
-      - expression: has(self.destinations) && self.destinations.size() > 0
-        message: at least one destination is required
-      # Destinations are ownership claims on shared clusters — explicit
-      # namespaces only, so admission policy can check uniqueness.
-      - expression: >-
-          !has(self.destinations) || self.destinations.all(d,
-            d.split('/').size() == 2 && d.split('/')[0] != '' &&
-            d.split('/')[1] != '' && !d.contains('*') && !d.contains('?'))
-        message: >-
-          destinations must be "<clusterName>/<namespace>" — explicit
-          namespace claims, no wildcards
-      # Cheap self-consistency check only: exact cluster ownership
-      # (including hyphen-prefix collisions between tenant names) is
-      # verified against ArgoCDTenantCluster instances by
-      # platform-policies.yaml at admission.
-      - expression: >-
-          !has(self.destinations) || self.destinations.all(d,
-            d.split('/')[0] == 'in-cluster' ||
-            d.split('/')[0].startsWith(self.tenant + '-'))
-        message: >-
-          destination cluster must be in-cluster or one of this tenant's
-          clusters (<tenant>-<name>)
-      - expression: >-
-          !has(self.sourceRepos) || self.sourceRepos.all(r,
-            r.startsWith('https://') || r.startsWith('git@') ||
-            r.startsWith('ssh://') || r.startsWith('oci://'))
-        message: sourceRepos entries must be https://, git@, ssh://, or oci:// URLs/globs
-      - expression: >-
-          !has(self.clusterResourceWhitelist) ||
-          self.clusterResourceWhitelist.all(gk,
-            gk.split('/').size() == 2 && gk.split('/')[1] != '')
-        message: clusterResourceWhitelist entries must be "group/Kind" (empty group as "/Kind")
+    # NOTE: KRO simple schema supports only field markers (required,
+    # default, enum, pattern, min/max, ...) — no CEL validation block.
+    # Per-item and cross-field rules (destination "<cluster>/<namespace>"
+    # shape, no wildcards, tenant--prefixed cluster refs, extras tenant-
+    # prefix, sourceRepos schemes, whitelist "group/Kind" shape) are
+    # enforced at admission by platform-policies.yaml instead.
     status:
       appProject: ${appProject.metadata.name}
       tenantNamespace: ${tenantNamespace.metadata.name}
@@ -114,11 +76,9 @@ spec:
     # AppProject (the fence) before the Namespace (the thing that grants
     # the tenant a place to act).
     #
-    # CAVEAT: this Namespace is cluster-scoped while the ArgoCDTenant
-    # instance is namespaced, and Kubernetes GC does not honor
-    # cluster-scoped dependents of namespaced owners. Verify on your KRO
-    # version whether it is cleaned up on instance deletion; if not, the
-    # offboarding runbook must delete tenant-<tenant> explicitly.
+    # Cross-scope cleanup verified on KRO v0.9.2: KRO tracks resources
+    # via applysets (not ownerReferences), so this cluster-scoped
+    # Namespace IS deleted when the namespaced instance is deleted.
     - id: tenantNamespace
       template:
         apiVersion: v1

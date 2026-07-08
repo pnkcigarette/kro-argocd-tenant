@@ -35,18 +35,26 @@ spec:
     kind: ArgoCDTenantCluster
     spec:
       # Must match an ArgoCDTenant instance's spec.tenant.
-      tenant: string | required=true
+      tenant: string | required=true pattern="^[a-z0-9]([a-z0-9-]{0,28}[a-z0-9])?$"
       # Short cluster name; registered in Argo CD as <tenant>-<name>.
-      name: string | required=true
-      # Kube API server URL of the target cluster.
-      server: string | required=true
-      # eks | aks | generic
-      provider: string | default="generic"
+      name: string | required=true pattern="^[a-z0-9]([a-z0-9-]{0,28}[a-z0-9])?$"
+      # Kube API server URL of the target cluster, host:port only. The
+      # claim registry canonicalizes destinations by server, so URL-format
+      # variance is an aliasing vector ('https://h:6443' vs '.../').
+      # host:port-only (no trailing slash/path) and immutability are both
+      # enforced in platform-policies.yaml, NOT here: KRO refuses to
+      # tighten a CRD pattern on an existing RGD (breaking-change guard),
+      # and does not honor the `immutable` marker. The pattern below is
+      # only a coarse scheme check. The claims policy also lowercases the
+      # server before comparing (DNS is case-insensitive); residual: :443
+      # explicit-vs-implicit is not normalized.
+      server: string | required=true pattern="^https://.+$"
+      provider: string | default="generic" enum="eks,aks,generic"
 
       # Base64-encoded CA bundle of the target cluster's API server.
       # Required for eks/aks (their certs are signed by the cluster CA);
       # must be empty for generic (CA travels in the Vault config JSON).
-      caData: string | default=""
+      caData: string | default="" pattern="^[A-Za-z0-9+/=]*$"
 
       # Allow the tenant to manage cluster-scoped resources on this
       # cluster (still bounded by the AppProject clusterResourceWhitelist).
@@ -56,13 +64,15 @@ spec:
       eks:
         clusterName: string | default=""
         # IAM role the Argo CD controllers assume via Pod Identity/IRSA.
-        roleARN: string | default=""
+        # Empty or a valid role ARN (presence when provider=eks is
+        # enforced by platform-policies.yaml).
+        roleARN: string | default="" pattern="^(arn:aws:iam::[0-9]{12}:role/.+)?$"
 
       # provider=aks only. The block is REQUIRED when provider=aks
       # (use "aks: {}" for defaults) so templates never dereference an
       # absent object.
       aks:
-        environment: string | default="AzurePublicCloud"
+        environment: string | default="AzurePublicCloud" enum="AzurePublicCloud,AzureUSGovernmentCloud,AzureChinaCloud"
 
       # provider=generic only.
       vault:
@@ -72,61 +82,19 @@ spec:
         namespace: string | default=""
         mount: string | default="kv"
         pathPrefix: string | default="argocd"
-        refreshAfter: string | default="60s"
+        refreshAfter: string | default="60s" pattern="^[0-9]+(s|m|h)$"
 
-    validation:
-      # Optional blocks are guarded with has() throughout: nested
-      # defaulting does not materialize absent parent objects, and an
-      # unguarded dereference would error instead of validating.
-      - expression: self.provider in ['eks', 'aks', 'generic']
-        message: provider must be one of eks, aks, generic
-      - expression: self.tenant.matches('^[a-z0-9]([a-z0-9-]{0,28}[a-z0-9])?$')
-        message: tenant must be a short RFC1123 name (lowercase alphanumeric and '-', max 30 chars)
-      - expression: self.name.matches('^[a-z0-9]([a-z0-9-]{0,28}[a-z0-9])?$')
-        message: name must be a short RFC1123 name (lowercase alphanumeric and '-', max 30 chars)
-      - expression: self.server.startsWith('https://')
-        message: server must be an https:// URL
-      # eks/aks API certs chain to the cluster's private CA — without
-      # caData Argo CD fails TLS verification against the endpoint.
-      - expression: self.provider == 'generic' || self.caData != ''
-        message: provider=eks/aks requires caData (base64 CA bundle of the target cluster)
-      - expression: self.provider != 'generic' || self.caData == ''
-        message: caData may only be set for eks/aks (generic carries its CA in the Vault config JSON)
-      - expression: >-
-          self.caData == '' || self.caData.matches('^[A-Za-z0-9+/=]+$')
-        message: caData must be base64
-      # eks requires its block; the ARN must be an IAM role.
-      - expression: >-
-          self.provider != 'eks' || (has(self.eks) && self.eks.clusterName != '' &&
-          self.eks.roleARN.matches('^arn:aws:iam::[0-9]{12}:role/.+$'))
-        message: provider=eks requires eks.clusterName and a valid eks.roleARN (arn:aws:iam::<account>:role/...)
-      # Unused provider blocks must stay empty — a filled-in block that
-      # will be silently ignored is a misconfiguration.
-      - expression: >-
-          self.provider == 'eks' || !has(self.eks) ||
-          (self.eks.clusterName == '' && self.eks.roleARN == '')
-        message: eks.* may only be set when provider=eks
-      # The aks block must be PRESENT for provider=aks — the template
-      # references aks.environment directly, and nested defaults only
-      # apply when the parent object exists.
-      - expression: >-
-          self.provider != 'aks' || (has(self.aks) && self.aks.environment in
-          ['AzurePublicCloud', 'AzureUSGovernmentCloud', 'AzureChinaCloud'])
-        message: 'provider=aks requires the aks block ("aks: {}" for defaults) with a valid environment'
-      # generic requires the tenant's Vault namespace; identity-based
-      # providers must not carry Vault config that would be ignored.
-      - expression: >-
-          self.provider != 'generic' || (has(self.vault) && self.vault.namespace != '')
-        message: provider=generic requires vault.namespace (the tenant's Vault namespace)
-      - expression: >-
-          self.provider == 'generic' || !has(self.vault) || self.vault.namespace == ''
-        message: vault.* may only be set when provider=generic (eks/aks use ambient pod identity)
-      - expression: >-
-          !has(self.vault) || self.vault.refreshAfter.matches('^[0-9]+(s|m|h)$')
-        message: vault.refreshAfter must be a duration like 60s, 5m, 1h
-
-    status:
-      clusterName: ${schema.spec.tenant}-${schema.spec.name}
+    # NOTE: KRO simple schema supports only field markers — no CEL
+    # validation block. Cross-field rules (caData required for eks/aks
+    # and forbidden for generic, provider=eks requires its block with a
+    # role ARN, provider=aks requires the aks block, provider=generic
+    # requires vault.namespace, unused provider blocks must stay empty)
+    # are enforced at admission by platform-policies.yaml instead.
+    #
+    # No custom status: KRO status fields may only reference resources
+    # (not schema), and which resource exists here depends on provider.
+    # The registered Argo CD cluster name is always deterministic:
+    # <tenant>-<name>.
 
   resources:
     # ------------------------------------------------------------------
