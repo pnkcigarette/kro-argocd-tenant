@@ -1,36 +1,36 @@
 ---
-# ResourceGraphDefinition: ArgoCDTenantRepo
+# ResourceGraphDefinition: ArgoCDProjectRepository
 #
-# One instance per repo (or per credential template) for a tenant.
-# The tenant writes creds into their Vault namespace at the agreed path:
+# One instance per repo (or per credential template) for a project.
+# The team writes creds into their Vault namespace at the agreed path:
 #
-#   <mount>/<pathPrefix>/<tenant>/repos/<name>
+#   <mount>/<pathPrefix>/<tenant>/<project>/repos/<name>
 #     username / password        (https)
 #     sshPrivateKey              (ssh)
 #
 # A VaultStaticSecret syncs that path into an Argo CD secret. Exactly one
 # of four variants materializes (includeWhen on secretType x credType) so
-# each secret carries only the keys that apply — no empty placeholder
-# keys, and repo-creds templates never carry repository-only fields.
+# each secret carries only the keys that apply.
 #
 #   secretType=repository -> project-scoped repo entry (data.project =
-#     tenant): even if a URL glob in some other AppProject matched it,
-#     the credential is only usable by this tenant's project.
+#     <tenant>-<project>): even if a URL glob in some other AppProject
+#     matched it, the credential is only usable by this project.
 #   secretType=repo-creds -> credential template for every repo under the
 #     URL prefix. NOTE: repo-creds are NOT project-scoped in Argo CD —
 #     any project whose sourceRepos matches a URL under the prefix gets
-#     these creds. Only use prefixes that are unique to the tenant.
+#     these creds. Only use prefixes unique to the tenant/project.
 apiVersion: kro.run/v1alpha1
 kind: ResourceGraphDefinition
 metadata:
-  name: argocdtenantrepo.kro.run
+  name: argocdprojectrepository.kro.run
 spec:
   schema:
     apiVersion: v1alpha1
-    kind: ArgoCDTenantRepo
+    kind: ArgoCDProjectRepository
     spec:
-      # Must match an ArgoCDTenant instance's spec.tenant.
+      # Must match an ArgoCDProject instance's spec.tenant + spec.name.
       tenant: string | required=true pattern="^[a-z0-9]([a-z0-9-]{0,28}[a-z0-9])?$"
+      project: string | required=true pattern="^[a-z0-9]([a-z0-9-]{0,28}[a-z0-9])?$"
       # Short repo name, used in resource/secret names and the Vault path.
       name: string | required=true pattern="^[a-z0-9]([a-z0-9-]{0,28}[a-z0-9])?$"
       url: string | required=true
@@ -45,7 +45,7 @@ spec:
       vault:
         # VaultAuth resource (in the argocd namespace) to authenticate with.
         authRef: string | default="vault-auth"
-        # Tenant's Vault Enterprise namespace.
+        # Team's Vault Enterprise namespace.
         namespace: string | required=true
         mount: string | default="kv"
         pathPrefix: string | default="argocd"
@@ -54,15 +54,13 @@ spec:
       # Which credential shape lives at the Vault path.
       credType: string | default="https" enum="https,ssh"
 
-    # NOTE: KRO simple schema supports only field markers — no CEL
-    # validation block. Cross-field rules (credType/url scheme agreement,
-    # oci:// requires repoType=helm + enableOCI) are enforced at
-    # admission by platform-policies.yaml instead.
+    # NOTE: cross-field rules (credType/url agreement, oci modeling,
+    # vault presence, identity immutability, dup checks) live in
+    # platform-policies.yaml — KRO simple schema has no CEL block.
     #
-    # No custom status: KRO status fields may only reference resources
-    # (not schema), and which resource exists here depends on the
-    # variant. The written Secret is always deterministic anyway:
-    # repo-<tenant>-<name> in the argocd namespace.
+    # No custom status: KRO status may only reference resources, and
+    # which resource exists depends on the variant. The written Secret is
+    # deterministic: repo-<tenant>-<project>-<name> in argocd.
 
   resources:
     # ------------------------------------------------------------------
@@ -76,34 +74,34 @@ spec:
         apiVersion: secrets.hashicorp.com/v1beta1
         kind: VaultStaticSecret
         metadata:
-          name: repo-${schema.spec.tenant}-${schema.spec.name}
+          name: repo-${schema.spec.tenant}-${schema.spec.project}-${schema.spec.name}
           namespace: argocd
           labels:
-            indstri.com/tenant: ${schema.spec.tenant}
+            example.com/tenant: ${schema.spec.tenant}
+            example.com/project: ${schema.spec.project}
         spec:
           vaultAuthRef: ${schema.spec.vault.authRef}
           namespace: ${schema.spec.vault.namespace}
           mount: ${schema.spec.vault.mount}
           type: kv-v2
-          path: ${schema.spec.vault.pathPrefix}/${schema.spec.tenant}/repos/${schema.spec.name}
+          path: ${schema.spec.vault.pathPrefix}/${schema.spec.tenant}/${schema.spec.project}/repos/${schema.spec.name}
           refreshAfter: ${schema.spec.vault.refreshAfter}
           hmacSecretData: true
           destination:
-            name: repo-${schema.spec.tenant}-${schema.spec.name}
+            name: repo-${schema.spec.tenant}-${schema.spec.project}-${schema.spec.name}
             create: true
             overwrite: true
             labels:
               argocd.argoproj.io/secret-type: repository
-              indstri.com/tenant: ${schema.spec.tenant}
+              example.com/tenant: ${schema.spec.tenant}
+              example.com/project: ${schema.spec.project}
             transformation:
-              # Only render the templated keys below; never copy raw
-              # Vault data into the secret.
               excludes:
                 - .*
               excludeRaw: true
               templates:
                 name:
-                  text: ${schema.spec.tenant}-${schema.spec.name}
+                  text: ${schema.spec.tenant}-${schema.spec.project}-${schema.spec.name}
                 url:
                   text: ${schema.spec.url}
                 type:
@@ -111,9 +109,9 @@ spec:
                 enableOCI:
                   text: ${string(schema.spec.enableOCI)}
                 # Hard project scoping: Argo CD only lets the named
-                # project use this repository credential.
+                # AppProject use this repository credential.
                 project:
-                  text: ${schema.spec.tenant}
+                  text: ${schema.spec.tenant}-${schema.spec.project}
                 username:
                   text: '{{- get .Secrets "username" -}}'
                 password:
@@ -130,44 +128,46 @@ spec:
         apiVersion: secrets.hashicorp.com/v1beta1
         kind: VaultStaticSecret
         metadata:
-          name: repo-${schema.spec.tenant}-${schema.spec.name}
+          name: repo-${schema.spec.tenant}-${schema.spec.project}-${schema.spec.name}
           namespace: argocd
           labels:
-            indstri.com/tenant: ${schema.spec.tenant}
+            example.com/tenant: ${schema.spec.tenant}
+            example.com/project: ${schema.spec.project}
         spec:
           vaultAuthRef: ${schema.spec.vault.authRef}
           namespace: ${schema.spec.vault.namespace}
           mount: ${schema.spec.vault.mount}
           type: kv-v2
-          path: ${schema.spec.vault.pathPrefix}/${schema.spec.tenant}/repos/${schema.spec.name}
+          path: ${schema.spec.vault.pathPrefix}/${schema.spec.tenant}/${schema.spec.project}/repos/${schema.spec.name}
           refreshAfter: ${schema.spec.vault.refreshAfter}
           hmacSecretData: true
           destination:
-            name: repo-${schema.spec.tenant}-${schema.spec.name}
+            name: repo-${schema.spec.tenant}-${schema.spec.project}-${schema.spec.name}
             create: true
             overwrite: true
             labels:
               argocd.argoproj.io/secret-type: repository
-              indstri.com/tenant: ${schema.spec.tenant}
+              example.com/tenant: ${schema.spec.tenant}
+              example.com/project: ${schema.spec.project}
             transformation:
               excludes:
                 - .*
               excludeRaw: true
               templates:
                 name:
-                  text: ${schema.spec.tenant}-${schema.spec.name}
+                  text: ${schema.spec.tenant}-${schema.spec.project}-${schema.spec.name}
                 url:
                   text: ${schema.spec.url}
                 type:
                   text: ${schema.spec.repoType}
                 project:
-                  text: ${schema.spec.tenant}
+                  text: ${schema.spec.tenant}-${schema.spec.project}
                 sshPrivateKey:
                   text: '{{- get .Secrets "sshPrivateKey" -}}'
 
     # ------------------------------------------------------------------
-    # repo-creds + https — creds-only keys; repo-creds are matched by URL
-    # prefix and are NOT project-scoped (see header note).
+    # repo-creds + https — creds-only keys; NOT project-scoped in Argo CD
+    # (see header note).
     # ------------------------------------------------------------------
     - id: credsHttps
       includeWhen:
@@ -177,25 +177,27 @@ spec:
         apiVersion: secrets.hashicorp.com/v1beta1
         kind: VaultStaticSecret
         metadata:
-          name: repo-${schema.spec.tenant}-${schema.spec.name}
+          name: repo-${schema.spec.tenant}-${schema.spec.project}-${schema.spec.name}
           namespace: argocd
           labels:
-            indstri.com/tenant: ${schema.spec.tenant}
+            example.com/tenant: ${schema.spec.tenant}
+            example.com/project: ${schema.spec.project}
         spec:
           vaultAuthRef: ${schema.spec.vault.authRef}
           namespace: ${schema.spec.vault.namespace}
           mount: ${schema.spec.vault.mount}
           type: kv-v2
-          path: ${schema.spec.vault.pathPrefix}/${schema.spec.tenant}/repos/${schema.spec.name}
+          path: ${schema.spec.vault.pathPrefix}/${schema.spec.tenant}/${schema.spec.project}/repos/${schema.spec.name}
           refreshAfter: ${schema.spec.vault.refreshAfter}
           hmacSecretData: true
           destination:
-            name: repo-${schema.spec.tenant}-${schema.spec.name}
+            name: repo-${schema.spec.tenant}-${schema.spec.project}-${schema.spec.name}
             create: true
             overwrite: true
             labels:
               argocd.argoproj.io/secret-type: repo-creds
-              indstri.com/tenant: ${schema.spec.tenant}
+              example.com/tenant: ${schema.spec.tenant}
+              example.com/project: ${schema.spec.project}
             transformation:
               excludes:
                 - .*
@@ -223,25 +225,27 @@ spec:
         apiVersion: secrets.hashicorp.com/v1beta1
         kind: VaultStaticSecret
         metadata:
-          name: repo-${schema.spec.tenant}-${schema.spec.name}
+          name: repo-${schema.spec.tenant}-${schema.spec.project}-${schema.spec.name}
           namespace: argocd
           labels:
-            indstri.com/tenant: ${schema.spec.tenant}
+            example.com/tenant: ${schema.spec.tenant}
+            example.com/project: ${schema.spec.project}
         spec:
           vaultAuthRef: ${schema.spec.vault.authRef}
           namespace: ${schema.spec.vault.namespace}
           mount: ${schema.spec.vault.mount}
           type: kv-v2
-          path: ${schema.spec.vault.pathPrefix}/${schema.spec.tenant}/repos/${schema.spec.name}
+          path: ${schema.spec.vault.pathPrefix}/${schema.spec.tenant}/${schema.spec.project}/repos/${schema.spec.name}
           refreshAfter: ${schema.spec.vault.refreshAfter}
           hmacSecretData: true
           destination:
-            name: repo-${schema.spec.tenant}-${schema.spec.name}
+            name: repo-${schema.spec.tenant}-${schema.spec.project}-${schema.spec.name}
             create: true
             overwrite: true
             labels:
               argocd.argoproj.io/secret-type: repo-creds
-              indstri.com/tenant: ${schema.spec.tenant}
+              example.com/tenant: ${schema.spec.tenant}
+              example.com/project: ${schema.spec.project}
             transformation:
               excludes:
                 - .*

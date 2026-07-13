@@ -26,23 +26,23 @@ check_rbac() { # <serviceaccount> <verb> <resource>
 }
 
 echo "== RBAC: admission controller must list the claim inputs =="
-for res in argocdtenants.kro.run argocdtenantclusters.kro.run \
-           argocdtenantrepoes.kro.run namespaces; do
+for res in argocdprojects.kro.run argocdclusters.kro.run \
+           argocdprojectrepositories.kro.run namespaces; do
   check_rbac "$ADM" list "$res"
 done
 
 echo "== RBAC: reports controller (background conflict scans) =="
-# repoes included: the repo field-guard has background eval and lists it.
-for res in argocdtenants.kro.run argocdtenantclusters.kro.run \
-           argocdtenantrepoes.kro.run namespaces; do
+# repositories included: the repo field-guard has background eval and lists it.
+for res in argocdprojects.kro.run argocdclusters.kro.run \
+           argocdprojectrepositories.kro.run namespaces; do
   check_rbac "$RPT" list "$res"
 done
 
 echo "== ValidatingPolicies must all be READY =="
-for p in argocd-tenant-project-binding argocd-appproject-guard \
-         argocd-tenant-namespace-guard argocd-tenant-destination-guard \
-         argocd-tenant-claims argocd-tenant-repo-field-guard \
-         argocd-tenant-cluster-field-guard argocd-tenant-referential-guard; do
+for p in argocd-project-binding argocd-appproject-guard \
+         argocd-project-namespace-guard argocd-project-destination-guard \
+         argocd-project-claims argocd-project-repo-field-guard \
+         argocd-cluster-field-guard argocd-referential-guard; do
   ready=$(kubectl get validatingpolicy "$p" -o jsonpath='{.status.conditionStatus.ready}' 2>/dev/null)
   if [ "$ready" = true ]; then
     echo "  ok   $p"

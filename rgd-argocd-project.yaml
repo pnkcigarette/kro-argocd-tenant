@@ -1,0 +1,244 @@
+---
+# ResourceGraphDefinition: ArgoCDProject
+#
+# Vocabulary: a TENANT is the org/team rollup (e.g. teamx) — a label +
+# field convention, not a CR. A PROJECT is the onboarding unit (e.g.
+# appa): one instance = one Argo CD AppProject + one source namespace +
+# one claim set. The unit string is "<tenant>-<name>" (teamx-appa).
+#
+# One instance per project. Creates:
+#   - The project's source namespace, tenant-<tenant>-<name>. The
+#     "tenant-" prefix is fixed platform-wide: it must match the
+#     apps-in-any-namespace glob (tenant-*) in argocd-cmd-params-cm and
+#     the guards in platform-policies.yaml.
+#   - AppProject "<tenant>-<name>" scoped to the project's repos,
+#     clusters, and source namespaces
+#   - Role/RoleBinding granting the project's IdP group management of
+#     Applications/ApplicationSets in the source namespace
+#   - Optional BOOTSTRAP Application (app-of-apps): syncs the project's
+#     Application/ApplicationSet manifests from bootstrap.repoUrl:path
+#     into the source namespace. The tenant's workload apps ride inside
+#     that path as their own Application specs (helm/kustomize/plain all
+#     auto-detected by Argo CD) — the platform never dictates app tooling.
+#
+# Project-binding enforcement (apps/appsets must set the project's
+# AppProject) is a single platform-wide ValidatingPolicy keyed on the
+# example.com/tenant + example.com/project namespace labels — see
+# platform-policies.yaml.
+#
+# Repos + creds: ArgoCDProjectRepository RGD. Clusters are GLOBAL, platform-
+# registered: ArgoCDCluster RGD. Namespace ownership on shared clusters
+# is enforced by the claims registry, not by cluster credentials.
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: argocdproject.kro.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    kind: ArgoCDProject
+    spec:
+      # Org/team rollup this project belongs to (the "who owns this"
+      # axis for reporting and label queries).
+      tenant: string | required=true pattern="^[a-z0-9]([a-z0-9-]{0,28}[a-z0-9])?$"
+      # Unit name. AppProject = <tenant>-<name>, source namespace =
+      # tenant-<tenant>-<name>. Single-app teams: name the unit after the
+      # team or the app (e.g. tenant=acme, name=main).
+      name: string | required=true pattern="^[a-z0-9]([a-z0-9-]{0,28}[a-z0-9])?$"
+      description: string | default=""
+
+      # Additional source namespaces beyond the derived one. Must match
+      # the tenant-* glob; label them with the project's tenant/project
+      # labels at approval time so the binding policy covers them.
+      extraSourceNamespaces: '[]string'
+
+      # Where the project may deploy, as "<clusterName>/<namespace>".
+      # Explicit namespace CLAIMS, not patterns — no wildcards. Cluster
+      # names are ArgoCDCluster registrations (or in-cluster). New claim
+      # namespaces must be prefixed "<tenant>-"; pre-existing namespaces
+      # need the example.com/tenant-deployable label (brownfield path).
+      # Uniqueness, existence, and the prefix are enforced at admission
+      # by platform-policies.yaml.
+      destinations: '[]string | required=true minItems=1 uniqueItems=true'
+
+      # Allowed source repo URLs / globs; keep in sync with the
+      # ArgoCDProjectRepository instances for this project.
+      sourceRepos: '[]string'
+
+      # IdP group granted the project admin role + namespace RBAC.
+      adminGroup: string | default=""
+
+      # Cluster-scoped resources the project may manage, as "group/Kind".
+      clusterResourceWhitelist: '[]string'
+
+      # Remote ServiceAccount Argo CD impersonates when syncing this
+      # project's apps (AppProject.spec.destinationServiceAccounts).
+      # STRONGLY recommended with global clusters: the shared cluster
+      # credential is broad, and this restores per-project blast radius
+      # on the destination cluster.
+      syncServiceAccount: string | default=""
+
+      # App-of-apps bootstrap: path in one of the project's repos
+      # containing ONLY Application/ApplicationSet manifests. Set repoUrl
+      # to enable. Argo CD auto-detects plain manifests / kustomize /
+      # helm at the path.
+      bootstrap:
+        repoUrl: string | default=""
+        path: string | default="argo-apps"
+        targetRevision: string | default="HEAD"
+
+    # NOTE: KRO simple schema supports only field markers — no CEL
+    # validation block. Per-item and cross-field rules live in
+    # platform-policies.yaml.
+    status:
+      appProject: ${appProject.metadata.name}
+      sourceNamespace: ${sourceNamespace.metadata.name}
+
+  resources:
+    # The namespace the project's apps/appsets live in. Derived, not
+    # chosen, so it always matches the argocd-cmd-params-cm glob. The
+    # appProject reference in the annotation makes KRO create the
+    # AppProject (the fence) before the Namespace (the thing that grants
+    # a place to act). Cross-scope cleanup verified on KRO v0.9.2 (KRO
+    # tracks via applysets, not ownerReferences).
+    - id: sourceNamespace
+      template:
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: tenant-${schema.spec.tenant}-${schema.spec.name}
+          labels:
+            example.com/tenant: ${schema.spec.tenant}
+            example.com/project: ${schema.spec.name}
+          annotations:
+            example.com/app-project: ${appProject.metadata.name}
+
+    - id: appProject
+      template:
+        apiVersion: argoproj.io/v1alpha1
+        kind: AppProject
+        metadata:
+          name: ${schema.spec.tenant}-${schema.spec.name}
+          # Fixed: the Argo CD namespace is a platform invariant.
+          namespace: argocd
+          labels:
+            example.com/tenant: ${schema.spec.tenant}
+            example.com/project: ${schema.spec.name}
+        spec:
+          description: ${schema.spec.description}
+          sourceRepos: >-
+            ${has(schema.spec.sourceRepos) ? schema.spec.sourceRepos : []}
+          sourceNamespaces: >-
+            ${["tenant-" + schema.spec.tenant + "-" + schema.spec.name] +
+              (has(schema.spec.extraSourceNamespaces) ? schema.spec.extraSourceNamespaces : [])}
+          # Every destination by name; in-cluster entries get an
+          # ADDITIONAL server-form entry (apps may target local by name
+          # or URL); the project's OWN source namespace is always
+          # appended (server-form) so the bootstrap app-of-apps is
+          # permitted out of the box. External clusters are name-only —
+          # apps must use destination.name.
+          destinations: >-
+            ${schema.spec.destinations.map(d,
+                {"name": d.split("/")[0], "namespace": d.split("/")[1]}) +
+              schema.spec.destinations.filter(d, d.split("/")[0] == "in-cluster").map(d,
+                {"server": "https://kubernetes.default.svc", "namespace": d.split("/")[1]}) +
+              [{"server": "https://kubernetes.default.svc",
+                "namespace": "tenant-" + schema.spec.tenant + "-" + schema.spec.name}]}
+          # Sync impersonation: restores per-project blast radius on
+          # shared clusters (the global cluster credential is broad).
+          # Built with a literal+filter (not an object ternary, which
+          # KRO's CEL support is not documented to cover).
+          destinationServiceAccounts: >-
+            ${[{"server": "*", "namespace": "*",
+                "defaultServiceAccount": schema.spec.syncServiceAccount}]
+              .filter(x, schema.spec.syncServiceAccount != "")}
+          clusterResourceWhitelist: >-
+            ${(has(schema.spec.clusterResourceWhitelist) ? schema.spec.clusterResourceWhitelist : [])
+              .map(gk, {"group": gk.split("/")[0], "kind": gk.split("/")[1]})}
+          namespaceResourceBlacklist:
+            - group: ""
+              kind: ResourceQuota
+            - group: ""
+              kind: LimitRange
+          orphanedResources:
+            warn: true
+          # Static role, CEL only on the groups list (a role with no
+          # groups is valid; an empty-string group is rejected by Argo).
+          roles:
+            - name: admin
+              description: Project admin
+              policies:
+                - p, proj:${schema.spec.tenant}-${schema.spec.name}:admin, applications, *, ${schema.spec.tenant}-${schema.spec.name}/*, allow
+                - p, proj:${schema.spec.tenant}-${schema.spec.name}:admin, applicationsets, *, ${schema.spec.tenant}-${schema.spec.name}/*, allow
+              groups: '${schema.spec.adminGroup == "" ? [] : [schema.spec.adminGroup]}'
+
+    # App-of-apps bootstrap. References sourceNamespace so it is created
+    # after the namespace (and therefore after the AppProject). If the
+    # project's repo creds haven't synced yet the app just sits in
+    # ComparisonError and self-heals when they land.
+    - id: bootstrapApp
+      includeWhen:
+        - ${has(schema.spec.bootstrap) && schema.spec.bootstrap.repoUrl != ""}
+      template:
+        apiVersion: argoproj.io/v1alpha1
+        kind: Application
+        metadata:
+          name: bootstrap
+          namespace: ${sourceNamespace.metadata.name}
+          labels:
+            example.com/tenant: ${schema.spec.tenant}
+            example.com/project: ${schema.spec.name}
+        spec:
+          project: ${schema.spec.tenant}-${schema.spec.name}
+          source:
+            repoURL: ${schema.spec.bootstrap.repoUrl}
+            path: ${schema.spec.bootstrap.path}
+            targetRevision: ${schema.spec.bootstrap.targetRevision}
+          destination:
+            server: https://kubernetes.default.svc
+            namespace: ${sourceNamespace.metadata.name}
+          syncPolicy:
+            automated:
+              prune: true
+              selfHeal: true
+
+    # Project self-service inside the source namespace: manage
+    # Applications/ApplicationSets only (break-glass once bootstrap is
+    # the paved road).
+    - id: adminRole
+      includeWhen:
+        - ${schema.spec.adminGroup != ""}
+      template:
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: Role
+        metadata:
+          name: argocd-project-admin
+          namespace: ${sourceNamespace.metadata.name}
+          labels:
+            example.com/tenant: ${schema.spec.tenant}
+            example.com/project: ${schema.spec.name}
+        rules:
+          - apiGroups: ["argoproj.io"]
+            resources: ["applications", "applicationsets"]
+            verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+    - id: adminBinding
+      includeWhen:
+        - ${schema.spec.adminGroup != ""}
+      template:
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: RoleBinding
+        metadata:
+          name: argocd-project-admin
+          namespace: ${sourceNamespace.metadata.name}
+          labels:
+            example.com/tenant: ${schema.spec.tenant}
+            example.com/project: ${schema.spec.name}
+        roleRef:
+          apiGroup: rbac.authorization.k8s.io
+          kind: Role
+          name: ${adminRole.metadata.name}
+        subjects:
+          - apiGroup: rbac.authorization.k8s.io
+            kind: Group
+            name: ${schema.spec.adminGroup}

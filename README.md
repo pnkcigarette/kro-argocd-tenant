@@ -1,304 +1,192 @@
-# KRO Argo CD Tenant
+# KRO Argo CD Tenancy
 
-Three ResourceGraphDefinitions that onboard an Argo CD tenant end to end:
+Self-service Argo CD multi-tenancy built from KRO ResourceGraphDefinitions
+and Kyverno ValidatingPolicies.
 
-| RGD | Instance kind | Creates |
+**Vocabulary:** a **tenant** is the org/team rollup (e.g. `teamx`) — a
+label + field convention, not a CR. A **project** is the onboarding unit
+(e.g. `appa`): one instance = one Argo CD AppProject (`teamx-appa`) + one
+source namespace (`tenant-teamx-appa`) + one claim set. A team with three
+apps onboards three projects sharing the same `tenant`.
+
+| File | Instance kind | Creates |
 |---|---|---|
-| `rgd-argocd-tenant.yaml` | `ArgoCDTenant` (one per tenant) | tenant Namespace, AppProject, admin Role/RoleBinding |
-| `rgd-argocd-tenant-repo.yaml` | `ArgoCDTenantRepo` (one per repo / cred template) | VaultStaticSecret → project-scoped Argo CD repository secret |
-| `rgd-argocd-tenant-cluster.yaml` | `ArgoCDTenantCluster` (one per external cluster) | plain Secret (eks/aks) or VaultStaticSecret (generic) → project-scoped Argo CD cluster secret |
+| `rgd-argocd-project.yaml` | `ArgoCDProject` (one per unit) | source Namespace, AppProject, admin Role/RoleBinding, optional bootstrap Application |
+| `rgd-argocd-project-repository.yaml` | `ArgoCDProjectRepository` (one per repo / cred template) | VaultStaticSecret → project-scoped Argo CD repository secret |
+| `rgd-argocd-cluster.yaml` | `ArgoCDCluster` (one per physical cluster, **platform-registered, global**) | plain Secret (eks/aks) or VaultStaticSecret (generic) → shared Argo CD cluster secret |
 
-Plus `platform-policies.yaml`, applied once — six Kyverno
+Plus `platform-policies.yaml`, applied once — eight Kyverno
 `ValidatingPolicy` resources (`policies.kyverno.io/v1`, verified on
-Kyverno v1.18, pure CEL): project-binding enforcement for apps/appsets
-in tenant namespaces, the AppProject sourceNamespaces invariant, the
-destination guard (shape + denylist + per-item field rules), the
-cross-tenant namespace-claim registry (via `resource.List`), and
-cross-field guards for the repo and cluster kinds (rules KRO's
-marker-only schema can't express).
-
-Multiple RGDs because KRO cannot fan a resource template out over a list —
-a tenant with N repos/clusters is N instances, not one instance with a
-list. Plain list *values* (`sourceRepos`, `destinations`) pass straight
-through to the AppProject.
+Kyverno v1.18, pure CEL) and the aggregated RBAC they need. Multiple RGDs
+because KRO cannot fan a resource template out over a list — N repos is N
+instances; plain list *values* pass straight through.
 
 ## Flow
 
-1. Platform applies the RGDs and `platform-policies.yaml`; KRO serves the
-   tenant APIs.
-2. Tenant is onboarded with an `ArgoCDTenant` instance. That creates the
-   AppProject first, then their app namespace (the Namespace carries a
-   reference to the AppProject so KRO orders it after the fence exists),
-   then the Role/RoleBinding granting their IdP group management of
-   Applications/ApplicationSets in that namespace. The namespace's
-   `indstri.com/tenant` label is what puts it under the platform
-   project-binding policy — no per-tenant policy is generated.
+1. Platform applies the RGDs and policies (see Apply below) and registers
+   shared clusters (`ArgoCDCluster`) once each.
+2. A team is onboarded with one `ArgoCDProject` per unit. Each creates the
+   AppProject first, then the source namespace (ordered via reference),
+   then RBAC — and, when `bootstrap.repoUrl` is set, a **bootstrap
+   Application** (app-of-apps) that syncs the team's
+   Application/ApplicationSet manifests from `repoUrl:path` (default path
+   `argo-apps`) into the source namespace. Argo CD auto-detects plain
+   manifests / kustomize / helm at that path, so the platform never
+   dictates app tooling. From then on, adding an app = a PR to the team's
+   repo; the namespace Role is break-glass.
+3. The team writes repo creds into **their** Vault namespace at
+   `<mount>/<pathPrefix>/<tenant>/<project>/repos/<name>`
+   (`username`/`password` or `sshPrivateKey`); `ArgoCDProjectRepository`
+   instances sync them into project-scoped repository secrets.
+4. Generic (non-cloud-identity) cluster creds live in the **platform**
+   Vault namespace at `<mount>/<pathPrefix>/clusters/<name>`
+   (key `config`).
 
-   There is no chicken/egg window: the only namespace a tenant can write
-   apps into is created by the same graph that creates their project, and
-   Argo CD itself only reconciles an Application in namespace X under
-   project P if `P.sourceNamespaces` contains X — since each tenant
-   namespace is listed by exactly one AppProject (see the platform
-   guard), claiming another project is rejected by the application
-   controller regardless of Kyverno.
-3. Tenant writes creds into **their** Vault namespace:
-   - repos: `<mount>/<pathPrefix>/<tenant>/repos/<name>` —
-     `username`/`password` or `sshPrivateKey`
-   - clusters: `<mount>/<pathPrefix>/<tenant>/clusters/<name>` —
-     `config` = `{"bearerToken": ..., "tlsClientConfig": {...}}`
-4. `ArgoCDTenantRepo` / `ArgoCDTenantCluster` instances deploy
-   VaultStaticSecrets that render those into Argo CD repository / cluster
-   secrets in the Argo CD namespace.
+There is no chicken/egg: the only namespace a project can put apps in is
+created by the same graph that creates its AppProject, Argo CD only
+reconciles an Application in namespace X under AppProject P if
+`P.sourceNamespaces` contains X, and the bootstrap app is machine-created
+by the RGD.
 
-## Namespace convention (the `tenant-*` glob)
+## Shared clusters (the claim model)
 
-argocd-cmd-params-cm has `application.namespaces` /
-`applicationsetcontroller.namespaces` set to `tenant-*`. The RGD leans on
-that instead of fighting it:
+Clusters are **global**: registered exactly once per physical cluster
+(one-per-server enforced, name/server immutable) and shared by any
+project. Argo CD's AppProject `destinations` — (cluster, namespace)
+tuples built *only* from validated claims — are the per-project gate.
 
-- The tenant's app namespace is **derived**, not chosen:
-  `tenant-<tenant>`, and the RGD creates it. It therefore always falls
-  inside the glob — no per-tenant ConfigMap edits, ever. The prefix is a
-  platform invariant (the ConfigMap glob and the guards in
-  `platform-policies.yaml` all assume it), so it is deliberately not a
-  schema knob.
-- `extraSourceNamespaces` allows additional namespaces, but a schema
-  `validation` CEL rule rejects any that don't start with `tenant-`, so
-  an instance can't silently reference a namespace Argo CD will ignore.
-
-What the RGD *can't* do is edit the glob itself — KRO composes new
-resources; it doesn't patch shared ConfigMaps. With the derived-namespace
-convention there's nothing left to patch.
-
-## Cluster scoping
-
-Argo CD cluster secrets support the same `project` data field as repo
-secrets. `ArgoCDTenantCluster` registers the cluster as
-`<tenant>-<name>` with `project: <tenant>`, which makes it a
-**project-scoped cluster**: it only resolves for that tenant's AppProject
-and is invisible to all other projects — another tenant declaring the same
-server URL in their destinations still has no credential to reach it.
-
-One API covers all providers via `spec.provider`; `includeWhen` picks
-exactly one cluster-secret resource per instance:
-
-| provider | auth | secret material |
-|---|---|---|
-| `eks` | `awsAuthConfig` — controllers assume `eks.roleARN` via Pod Identity/IRSA | none, plain Secret |
-| `aks` | `execProviderConfig` — `argocd-k8s-auth azure` with AAD workload identity | none, plain Secret |
-| `generic` | bearer token / TLS from the tenant's Vault namespace | VaultStaticSecret |
-
-eks/aks API servers present certs signed by the cluster's own CA, so
-those providers require `caData` (base64 CA bundle — for EKS,
-`aws eks describe-cluster --query cluster.certificateAuthority.data`);
-`generic` carries its CA inside the Vault-held config JSON.
-
-Schema-level CEL `validation` enforces the provider contract at admission:
-provider enum, `https://` server, EKS role-ARN format, Azure environment
-enum, `caData` required for eks/aks, `vault.namespace` required for
-`generic` — and, to catch silent misconfiguration, unused provider blocks
-(`eks.*`, `vault.*`, `caData` for generic) must be empty.
-
-`ArgoCDTenant.spec.destinations` takes `"<clusterName>/<namespace>"`
-entries — `in-cluster` for the local cluster, or the `<tenant>-<name>`
-of an `ArgoCDTenantCluster`. `in-cluster` is rendered as a **server**
-destination (`https://kubernetes.default.svc`), so apps may target it by
-name or URL; external clusters are rendered **name-only**, so apps
-targeting them must use `destination.name`, not `destination.server`
-(a name-only project destination doesn't match a server-only app
-destination). Ownership of external cluster names is checked exactly at
-admission against `ArgoCDTenantCluster` instances (the RGD's own
-prefix check is only a fast self-consistency hint — prefix matching
-alone would let tenant `payments` reference `payments-eu-prod` belonging
-to tenant `payments-eu`). Cluster-scoped resource access stays off
-unless both `ArgoCDTenantCluster.spec.clusterResources` and the
-AppProject `clusterResourceWhitelist` allow it.
-
-## Namespace claims (new namespaces, shared clusters)
-
-Destination namespaces are **explicit ownership claims, not patterns** —
-tenants name namespaces freely, so allow-globs can't express ownership,
-and on shared clusters two tenants could want the same name. Wildcards in
-`destinations` are rejected by the RGD's own CEL validation; correctness
-comes from `platform-policies.yaml` at admission:
-
-- **System-namespace guard**: destinations may never target platform
-  namespaces (`kube-*`, `argocd`, `kyverno`, `vault-secrets-operator`, …)
-  or another tenant's `tenant-*` app namespace.
-- **Claim registry** (`argocd-tenant-claims`): a CEL `resource.List`
-  over the other `ArgoCDTenant` / `ArgoCDTenantCluster` instances denies
-  a create/update that (a) reuses an existing `spec.tenant` from a
-  different instance, (b) claims a destination namespace already owned by
-  another tenant — **compared by server URL**, with cluster names
-  resolved through the `ArgoCDTenantCluster` instances, so registering
-  the same physical cluster under a different name doesn't evade the
-  claim, (c) references a cluster registered by another tenant, or
-  (d) claims a source namespace (derived *or* extra) owned by another
-  tenant. First-come-first-claim; disputes are settled in PR review.
-- **Positive claim for existing hub namespaces**: an `in-cluster`
-  destination namespace that already exists must be the tenant's own or
-  carry `indstri.com/tenant-deployable: "true"` — so platform namespaces
-  (monitoring, ingress, cert-manager, …) are protected by default
-  instead of relying on a denylist keeping up. Namespaces that don't
-  exist yet are claimable; the denylist remains as the belt for external
-  clusters, which the hub can't inspect.
-- **`tenant-*` is a reserved namespace prefix**: every namespace named
-  `tenant-*` must carry `indstri.com/tenant` equal to its name suffix
-  (the RGD-created ones do). This closes the gap where an unlabeled
-  `tenant-*` namespace would evade the label-matched project-binding
-  policy — but it also means the platform must not name unrelated infra
-  `tenant-...` (the Argo CD apps-in-any-namespace glob claims that space
-  regardless).
-- **Race detector**: admission checks read Kyverno's informer cache, so
-  two near-simultaneous writes can both pass. The claims policy also runs
-  in background mode — a conflict that slips through a race shows up in
-  PolicyReports on the next scan rather than staying invisible.
-
-Adding a namespace is therefore a PR appending one `destinations` entry.
-Once admitted, the claim is exclusive, so letting the tenant's apps use
-`CreateNamespace=true` is safe — Argo CD only syncs to namespaces the
-AppProject lists.
+- **Claims**: `ArgoCDProject.spec.destinations` entries
+  (`"<clusterName>/<namespace>"`) are explicit, exclusive,
+  first-come-first-claim namespace ownership records. No globs (Argo CD
+  treats destination namespaces as glob patterns, so `[?*` are rejected).
+  projectA and projectB share a cluster and differ by namespace.
+- **Anti-squatting prefix**: new destination namespaces must be prefixed
+  `"<tenant>-"` (`teamx-appa-dev`, not `dev`) — generic-name landgrabs
+  are impossible by construction. Pre-existing namespaces (brownfield)
+  are claimable once the platform labels them
+  `example.com/tenant-deployable: "true"`.
+- **Existence**: destinations must reference a registered `ArgoCDCluster`
+  (or `in-cluster`) — clusters pre-exist projects.
+- **Blast radius**: the shared cluster credential is broad, so projects
+  set `syncServiceAccount` — rendered as AppProject
+  `destinationServiceAccounts`, Argo CD impersonates that remote SA when
+  syncing, restoring per-project limits on the destination cluster.
+- **`labels`** on `ArgoCDCluster` merge into the cluster secret's
+  metadata (for ApplicationSet cluster generators). Platform keys win on
+  merge; reserved prefixes (`argocd.argoproj.io/`, `example.com/`) are
+  rejected at admission.
+- **Race detector**: admission reads Kyverno's informer cache, so
+  near-simultaneous writes can race; claim policies also run in
+  background mode and surface conflicts in PolicyReports.
 
 ## Project restriction (the tenancy boundary)
 
 - **AppProject**: `sourceRepos`, derived `sourceNamespaces`, and
-  name-based `destinations` bound what the project may do.
-- **`project` field on repo *and* cluster secrets**: credentials are
-  usable only by the tenant's project, even if another project's globs
-  match the URL/server.
-- **Platform `ValidatingPolicy` (`argocd-tenant-project-binding`)**: any
-  `Application`/`ApplicationSet` in a namespace labeled
-  `indstri.com/tenant=<t>` is rejected unless `spec.project` (or
-  `spec.template.spec.project` for appsets) equals `<t>` — one policy for
-  all tenants, keyed on the namespace label via `namespaceObject`,
-  closing the apps-in-any-namespace gap of referencing someone else's
-  project.
+  claim-built `destinations` bound what each project may do. `in-cluster`
+  destinations get a server-form entry too; the project's own source
+  namespace is always appended so the bootstrap app-of-apps works.
+- **Repository secrets** carry `project: <tenant>-<name>` — usable only
+  by that AppProject. (`repo-creds` templates are NOT project-scoped in
+  Argo CD; only use tenant-unique URL prefixes.)
+- **`argocd-project-binding`**: any Application/ApplicationSet in a
+  namespace labeled `example.com/tenant` + `example.com/project` must set
+  `spec.project` to `<tenant>-<project>` — readable failure at admission;
+  Argo CD `sourceNamespaces` is the hard backstop.
+- **`tenant-*` is a reserved namespace prefix**: every such namespace
+  must be named `tenant-<tenant>-<project>` with matching labels, so an
+  unlabeled/mislabeled namespace can't evade the label-matched binding.
+- **AppProject guard**: no glob sourceNamespaces anywhere; labeled
+  AppProjects may only list namespaces belonging to their own label pair.
+
+## Labels (ownership rollup)
+
+Everything rendered carries `example.com/tenant` + `example.com/project`.
+Rollup queries: `kubectl get appprojects,ns,vaultstaticsecrets -A -l
+example.com/tenant=teamx`. Clusters are shared infra and carry
+`example.com/cluster` instead; "who uses cluster X" is answered by the
+claim registry (`ArgoCDProject` destinations).
+
+## Day-2 operations
+
+- **Renames are blocked, not silent data-loss.** `spec.tenant`/`spec.name`
+  on projects (and repo/cluster identity fields) are immutable — KRO's
+  applyset would prune-and-recreate the namespace/AppProject/secrets.
+  Delete and recreate to rename.
+- **Offboarding order — children first.** The referential guard denies
+  deleting a project while its `ArgoCDProjectRepository` instances exist:
+
+  ```sh
+  kubectl delete argocdprojectrepositories -n argocd \
+    -l example.com/tenant=<tenant>,example.com/project=<name>
+  kubectl delete argocdproject <tenant>-<name> -n argocd
+  ```
+
+- **Cluster deletion is guarded**: an `ArgoCDCluster` cannot be deleted
+  while any project lists it in destinations — remove those destinations
+  first. (No deadlock: clusters are not children of projects.)
+- **Policy updates on a live cluster are safe**: `create-or-spec-changed`
+  matchConditions mean KRO's reconcile (metadata-only applies) won't
+  re-deny grandfathered instances; background eval reports pre-existing
+  violations instead of blocking.
+- **Removing a claim** releases the namespace record but does not delete
+  the namespace on the target cluster; clean up out of band.
 
 ## Prerequisites / caveats
 
-- argocd-cmd-params-cm: `application.namespaces` and
-  `applicationsetcontroller.namespaces` = `tenant-*` (already in place).
-- Vault Secrets Operator (v0.4+ for `transformation`) with a shared
-  `VaultAuth` (default name `vault-auth`) in the Argo CD namespace whose
-  Vault role can read across tenant Vault namespaces, or override
-  `vault.authRef` per tenant.
-- `ArgoCDTenant.spec.sourceRepos` and the `ArgoCDTenantRepo` URLs must
-  stay in sync — a URL glob per tenant (e.g.
-  `https://github.com/indstri/payments-*`) keeps that maintenance-free.
-- `secretType: repo-creds` turns a repo instance into a credential
-  template for every repo under the URL prefix. **repo-creds are not
-  project-scoped in Argo CD** — any project whose `sourceRepos` matches a
-  URL under the prefix gets the credentials — so only use prefixes
-  unique to the tenant (org/team path, not a shared host).
-- Helm OCI registries are `repoType: helm` + `enableOCI: true` with an
-  `oci://` url (Argo CD has no distinct oci repo type); validation
-  enforces the combination.
-- `provider: aks` requires the `aks:` block to be present (`aks: {}` for
-  defaults).
-- The tenant Namespace is cluster-scoped while the `ArgoCDTenant`
-  instance is namespaced. Verified on KRO v0.9.2: KRO tracks resources
-  via applysets (not ownerReferences), and the Namespace IS deleted when
-  the instance is deleted.
-- Kyverno `ValidatingPolicy` at `policies.kyverno.io/v1` (verified on
-  Kyverno v1.18; v1alpha1 is deprecated). The claims policy uses the
-  Kyverno CEL `resource.List` library, so it runs in the Kyverno engine
-  rather than compiling to a native ValidatingAdmissionPolicy. Kyverno
-  CEL quirks handled in the policies: `variables.*` are typed `any` and
-  need `dyn()` casts before comprehensions; every policy carries a
-  `not-being-deleted` matchCondition so finalizer-removal updates on
-  already-invalid objects don't deadlock deletion; and the
-  ArgoCDTenantRepo plural is `argocdtenantrepoes` (KRO's pluralizer).
-- The RGD labels the derived tenant namespace `indstri.com/tenant`;
-  `extraSourceNamespaces` must be given the same label at approval time
-  or the project-binding policy won't cover them (Argo CD's own
-  sourceNamespaces check still applies either way).
-- KRO v0.9.2 verified (KIND): simple schema supports **field markers
-  only** (`required`, `default`, `enum`, `pattern`, `minItems`, …) — no
-  CEL `validation` block, so cross-field rules live in
-  `platform-policies.yaml`; RGD `status` fields may only reference
-  resources, not `schema`, so the repo/cluster RGDs expose no custom
-  status (their output names are deterministic). Template CEL
-  (`map`/`filter`/list concat, ternaries, `has()`) compiles and
-  reconciles correctly.
-- Destinations-by-name requires the local cluster to be reachable as
-  `in-cluster` (default in current Argo CD).
+- Argo CD apps-in-any-namespace: `application.namespaces` and
+  `applicationsetcontroller.namespaces` = `tenant-*` in
+  argocd-cmd-params-cm (managed centrally; the derived namespaces always
+  match). Local cluster reachable as `in-cluster`; project sync
+  impersonation (`destinationServiceAccounts`) needs Argo CD ≥ 2.13.
+- Vault Secrets Operator (v0.4+) with a shared `VaultAuth`
+  (default `vault-auth`) in `argocd`.
+- KRO v0.9.2 verified (KIND): field markers only (no CEL `validation`
+  block); `status` may only reference resources; template CEL
+  (`map`/`filter`/concat/ternary/`has()`/`maps.merge`) works; applyset GC
+  cleans cluster-scoped children; **deleting an RGD does NOT delete its
+  CRD or instances** (migrations must delete CRDs explicitly and strip
+  orphaned `kro.run/finalizer`s).
+- Kyverno `ValidatingPolicy` at `policies.kyverno.io/v1` (verified
+  v1.18). Quirks handled: `dyn()` casts on variables,
+  `not-being-deleted` + `create-or-spec-changed` matchConditions, KRO
+  plurals (`argocdprojectrepositories`).
 
 ## Apply
 
 ```sh
-# RGDs FIRST: the claims policy resource.List's argocdtenants,
-# argocdtenantclusters, and namespaces — with failurePolicy Fail, a
-# missing CRD locks out all tenant writes until it exists.
-kubectl apply -f rgd-argocd-tenant.yaml \
-              -f rgd-argocd-tenant-repo.yaml \
-              -f rgd-argocd-tenant-cluster.yaml
+# RGDs FIRST: the claim policies resource.List the kro.run kinds — with
+# failurePolicy Fail, a missing CRD locks out all project writes.
+kubectl apply -f rgd-argocd-project.yaml \
+              -f rgd-argocd-project-repository.yaml \
+              -f rgd-argocd-cluster.yaml
 kubectl wait --for condition=established \
-  crd/argocdtenants.kro.run crd/argocdtenantclusters.kro.run \
-  crd/argocdtenantrepoes.kro.run   # note KRO's plural: repoES
+  crd/argocdprojects.kro.run crd/argocdclusters.kro.run \
+  crd/argocdprojectrepositories.kro.run
 kubectl apply -f platform-policies.yaml
 bash tests/preflight.sh            # HARD GATE — see below
-kubectl apply -f examples/tenant-payments.yaml   # sample tenant
+kubectl apply -f examples/tenant-teamx.yaml   # sample tenant
 ```
 
-**Preflight is a hard gate, not advice.** All policies except
-`argocd-tenant-project-binding` are `failurePolicy: Fail`, and the
-claims/appproject/field-guard policies `resource.List` the kro.run kinds
-and namespaces via an aggregated ClusterRole. If that aggregation didn't
-take (Kyverno chart labels differ from the assumed
-`app.kubernetes.io/instance=kyverno`), the lookups fail and tenant writes
-are denied with an opaque error mid-onboarding. `tests/preflight.sh`
-fails the rollout unless both the admission and reports controllers can
-list `argocdtenants`, `argocdtenantclusters`, `argocdtenantrepoes`, and
-`namespaces`, and all six policies report `READY=true`. Run it after
-every policy apply. The ClusterRole aggregates via
-`rbac.kyverno.io/aggregate-to-admission-controller|reports-controller`
-(Kyverno 1.11+; `app.kubernetes.io/*` labels cover older charts) — if
-preflight fails, that label set is the first thing to check.
+**Preflight is a hard gate.** All policies except `argocd-project-binding`
+and `argocd-referential-guard` are `failurePolicy: Fail`, and the claim
+policies `resource.List` the kro.run kinds + namespaces via an aggregated
+ClusterRole. If aggregation didn't take (chart labels differ from
+`app.kubernetes.io/instance=kyverno`), project writes fail closed with an
+opaque error. `tests/preflight.sh` fails unless both Kyverno controllers
+can list everything and all eight policies are READY. SA names are
+overridable: `KYVERNO_NS=... ADM_SA=... RPT_SA=... bash tests/preflight.sh`.
 
 ### Availability note (prod)
 
-`argocd-tenant-project-binding` is deliberately `failurePolicy: Ignore`:
-it matches every Application/ApplicationSet write in a tenant namespace,
-and Argo CD's own `sourceNamespaces` check is the hard enforcer, so a
-Kyverno outage must not block tenant app deploys. Every other policy is
-`Fail` (fail-closed) because it IS the boundary — run Kyverno's admission
-controller HA (≥2 replicas) so those policies aren't a single point of
-failure for onboarding.
+`argocd-project-binding` is `failurePolicy: Ignore` (it matches every app
+write in project namespaces; Argo CD `sourceNamespaces` is the hard
+enforcer). `argocd-referential-guard` is `Ignore` (teardown must survive a
+Kyverno outage). Everything else fails closed because it IS the boundary —
+run Kyverno's admission controller HA (≥2 replicas).
 
-## Day-2 operations
+## Tests
 
-- **Renames are blocked, not silent data-loss.** `ArgoCDTenant.spec.tenant`
-  and the `spec.tenant`/`spec.name` of repos/clusters are the objects'
-  identities — they name the AppProject, the `tenant-<tenant>` namespace,
-  and the Argo CD secrets. Editing them would make KRO's applyset prune
-  the old-named resources (cascade-deleting the tenant's workloads) and
-  create empty new ones, so admission policies reject the change. To
-  "rename", delete and recreate. (`spec.server` on a cluster is likewise
-  immutable.)
-- **Offboarding order — children first.** Deleting an `ArgoCDTenant` does
-  not cascade to its separately-managed repo/cluster instances, so the
-  referential guard denies deleting a tenant while any `ArgoCDTenantRepo`
-  or `ArgoCDTenantCluster` of that tenant still exists (otherwise their
-  Vault-synced credential secrets would be orphaned). Teardown:
-
-  ```sh
-  kubectl delete argocdtenantrepoes,argocdtenantclusters \
-    -n argocd -l indstri.com/tenant=<tenant>
-  kubectl delete argocdtenant <tenant> -n argocd
-  ```
-
-- **Deleting a cluster a tenant still references** is allowed (guarding it
-  would deadlock against the rule above). It leaves that tenant's
-  `destinations` entry dangling until you remove it — apps targeting it
-  fail, but there's no cross-tenant risk: the `<tenant>-<name>` naming
-  rule means only the same tenant can ever re-register that name. Drop the
-  destination from the tenant, or re-register the cluster.
-- **Changing a claim.** Removing a `destinations` entry releases the
-  namespace claim but does not delete the namespace on the target cluster
-  (Argo CD created it via `CreateNamespace`); clean it up out of band if
-  needed.
-- **Applying policy updates to a live cluster** is safe: the
-  `create-or-spec-changed` matchConditions mean KRO's reconcile
-  (metadata-only main-resource applies) won't re-deny grandfathered
-  instances, and background eval reports pre-existing violations in
-  PolicyReports rather than blocking.
+`tests/policy-tests.sh` — deny/allow matrix (26 checks) covering claims,
+sharing, squatting, brownfield, identity immutability, offboarding order,
+bootstrap rendering, and label merging. Asserts deny *reasons*, cleans up
+after itself, safe to re-run back-to-back.

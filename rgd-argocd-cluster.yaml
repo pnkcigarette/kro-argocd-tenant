@@ -1,0 +1,188 @@
+---
+# ResourceGraphDefinition: ArgoCDCluster
+#
+# GLOBAL, platform-registered destination clusters (not tenant-owned).
+# One instance per physical cluster; projects reference it by spec.name
+# in their destinations and differ by NAMESPACE — the claims registry in
+# platform-policies.yaml enforces per-namespace ownership on shared
+# clusters. One instance per server (dup-checked); server and name are
+# immutable.
+#
+# The rendered cluster secret carries NO project scoping: Argo CD's
+# AppProject destinations (built only from validated claims) are the
+# per-project gate. Because the single cluster credential is therefore
+# broad, projects should set syncServiceAccount (AppProject
+# destinationServiceAccounts) to restore per-project blast radius on the
+# destination cluster.
+#
+#   eks     -> plain Secret, config.awsAuthConfig (EKS Pod Identity /
+#              IRSA on the Argo CD controllers assumes eks.roleARN)
+#   aks     -> plain Secret, config.execProviderConfig running
+#              argocd-k8s-auth azure with AAD workload identity
+#   generic -> VaultStaticSecret; the PLATFORM writes connection config at
+#                <mount>/<pathPrefix>/clusters/<name>  (key "config":
+#                {"bearerToken": ..., "tlsClientConfig": {...}})
+#
+# eks/aks API servers present certs signed by the cluster's own CA, so
+# caData (base64 CA bundle) is required for those providers; generic
+# carries its CA inside the Vault-held config JSON.
+#
+# Provider blocks carry NO schema defaults, so an EKS instance's stored
+# spec contains no aks/vault fields (structural defaulting would
+# otherwise materialize them). Fallbacks are applied in template CEL.
+#
+# spec.labels are merged into the secret's metadata labels (ours win on
+# conflict) — use them for ApplicationSet cluster-generator selectors.
+# Reserved prefixes are rejected at admission.
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: argocdcluster.kro.run
+spec:
+  schema:
+    apiVersion: v1alpha1
+    kind: ArgoCDCluster
+    spec:
+      # Canonical cluster name — what project destinations reference.
+      name: string | required=true pattern="^[a-z0-9]([a-z0-9-]{0,28}[a-z0-9])?$"
+      # Kube API server URL, host:port only (no trailing slash/path —
+      # enforced in policy; KRO can't tighten patterns post-creation).
+      # Immutable (policy-enforced; the claims registry keys on the
+      # name->server mapping).
+      server: string | required=true pattern="^https://.+$"
+      provider: string | default="generic" enum="eks,aks,generic"
+
+      # Base64 CA bundle of the target API server. Required for eks/aks;
+      # must be absent/empty for generic (CA travels in the Vault JSON).
+      caData: string | default="" pattern="^[A-Za-z0-9+/=]*$"
+
+      # Allow projects to manage cluster-scoped resources here (still
+      # bounded per-project by AppProject clusterResourceWhitelist).
+      clusterResources: boolean | default=false
+
+      # Extra metadata labels for the cluster secret (ApplicationSet
+      # cluster-generator selectors). Reserved prefixes
+      # (argocd.argoproj.io/, example.com/) are rejected at admission;
+      # platform labels win on merge.
+      labels: 'map[string]string'
+
+      # provider=eks only (block required then; forbidden otherwise).
+      eks:
+        clusterName: string
+        # IAM role the Argo CD controllers assume via Pod Identity/IRSA.
+        roleARN: string | pattern="^arn:aws:iam::[0-9]{12}:role/.+$"
+
+      # provider=aks only. environment is required when provider=aks
+      # (no default — defaults would materialize the block on every
+      # instance's stored spec).
+      aks:
+        environment: string | enum="AzurePublicCloud,AzureUSGovernmentCloud,AzureChinaCloud"
+
+      # provider=generic only (block required then; forbidden otherwise).
+      vault:
+        # VaultAuth resource (in the argocd namespace).
+        authRef: string
+        # PLATFORM Vault namespace holding shared cluster creds.
+        namespace: string | required=true
+        mount: string
+        pathPrefix: string
+        refreshAfter: string | pattern="^[0-9]+(s|m|h)$"
+
+    # Cross-field rules (provider/block agreement, caData, host:port,
+    # immutability, one-per-server) live in platform-policies.yaml.
+
+  resources:
+    # ------------------------------------------------------------------
+    # provider=eks — IAM auth, no secret material.
+    # ------------------------------------------------------------------
+    - id: eksClusterSecret
+      includeWhen:
+        - ${schema.spec.provider == "eks"}
+      template:
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: cluster-${schema.spec.name}
+          namespace: argocd
+          labels: >-
+            ${(has(schema.spec.labels) ? schema.spec.labels : {}).merge({
+              "argocd.argoproj.io/secret-type": "cluster",
+              "example.com/cluster": schema.spec.name})}
+        type: Opaque
+        stringData:
+          name: ${schema.spec.name}
+          server: ${schema.spec.server}
+          clusterResources: ${string(schema.spec.clusterResources)}
+          config: >-
+            {"awsAuthConfig":{"clusterName":"${schema.spec.eks.clusterName}","roleARN":"${schema.spec.eks.roleARN}"},"tlsClientConfig":{"insecure":false,"caData":"${schema.spec.caData}"}}
+
+    # ------------------------------------------------------------------
+    # provider=aks — AAD workload identity via argocd-k8s-auth.
+    # ------------------------------------------------------------------
+    - id: aksClusterSecret
+      includeWhen:
+        - ${schema.spec.provider == "aks"}
+      template:
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: cluster-${schema.spec.name}
+          namespace: argocd
+          labels: >-
+            ${(has(schema.spec.labels) ? schema.spec.labels : {}).merge({
+              "argocd.argoproj.io/secret-type": "cluster",
+              "example.com/cluster": schema.spec.name})}
+        type: Opaque
+        stringData:
+          name: ${schema.spec.name}
+          server: ${schema.spec.server}
+          clusterResources: ${string(schema.spec.clusterResources)}
+          config: >-
+            {"execProviderConfig":{"command":"argocd-k8s-auth","args":["azure"],"apiVersion":"client.authentication.k8s.io/v1beta1","env":{"AAD_ENVIRONMENT_NAME":"${schema.spec.aks.environment}","AAD_LOGIN_METHOD":"workloadidentity"}},"tlsClientConfig":{"insecure":false,"caData":"${schema.spec.caData}"}}
+
+    # ------------------------------------------------------------------
+    # provider=generic — bearer token / TLS creds synced from the
+    # PLATFORM Vault namespace. Un-defaulted vault leaves get their
+    # fallbacks via standalone CEL ternaries (parent presence is
+    # policy-enforced for provider=generic).
+    # ------------------------------------------------------------------
+    - id: genericClusterSecret
+      includeWhen:
+        - ${schema.spec.provider == "generic"}
+      template:
+        apiVersion: secrets.hashicorp.com/v1beta1
+        kind: VaultStaticSecret
+        metadata:
+          name: cluster-${schema.spec.name}
+          namespace: argocd
+          labels:
+            example.com/cluster: ${schema.spec.name}
+        spec:
+          vaultAuthRef: '${has(schema.spec.vault.authRef) ? schema.spec.vault.authRef : "vault-auth"}'
+          namespace: ${schema.spec.vault.namespace}
+          mount: '${has(schema.spec.vault.mount) ? schema.spec.vault.mount : "kv"}'
+          type: kv-v2
+          path: '${(has(schema.spec.vault.pathPrefix) ? schema.spec.vault.pathPrefix : "argocd") + "/clusters/" + schema.spec.name}'
+          refreshAfter: '${has(schema.spec.vault.refreshAfter) ? schema.spec.vault.refreshAfter : "60s"}'
+          hmacSecretData: true
+          destination:
+            name: cluster-${schema.spec.name}
+            create: true
+            overwrite: true
+            labels: >-
+              ${(has(schema.spec.labels) ? schema.spec.labels : {}).merge({
+                "argocd.argoproj.io/secret-type": "cluster",
+                "example.com/cluster": schema.spec.name})}
+            transformation:
+              excludes:
+                - .*
+              excludeRaw: true
+              templates:
+                name:
+                  text: ${schema.spec.name}
+                server:
+                  text: ${schema.spec.server}
+                clusterResources:
+                  text: ${string(schema.spec.clusterResources)}
+                config:
+                  text: '{{- get .Secrets "config" -}}'

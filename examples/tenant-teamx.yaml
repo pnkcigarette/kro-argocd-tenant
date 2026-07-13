@@ -1,0 +1,125 @@
+---
+# GLOBAL clusters — platform-registered once per physical cluster, then
+# shared by any project via namespace claims.
+#
+# EKS cluster: no secret material, the Argo CD controllers assume the
+# role via Pod Identity / IRSA.
+apiVersion: kro.run/v1alpha1
+kind: ArgoCDCluster
+metadata:
+  name: prod-east
+  namespace: argocd
+spec:
+  name: prod-east
+  server: https://ABC123.gr7.us-east-1.eks.amazonaws.com
+  provider: eks
+  # PLACEHOLDER — decodes to "REPLACE-WITH-REAL-CA". Real value:
+  #   aws eks describe-cluster --name <cluster> \
+  #     --query cluster.certificateAuthority.data --output text
+  caData: UkVQTEFDRS1XSVRILVJFQUwtQ0E=
+  eks:
+    clusterName: prod-east
+    roleARN: arn:aws:iam::123456789012:role/argocd-deployer
+  # Extra labels for ApplicationSet cluster generators (platform keys
+  # win on merge; reserved prefixes rejected).
+  labels:
+    env: prod
+    region: us-east-1
+---
+# On-prem/generic cluster: bearer-token config synced from the PLATFORM
+# Vault namespace (kv/argocd/clusters/onprem-dc1, key "config":
+# {"bearerToken": ..., "tlsClientConfig": {...}}).
+apiVersion: kro.run/v1alpha1
+kind: ArgoCDCluster
+metadata:
+  name: onprem-dc1
+  namespace: argocd
+spec:
+  name: onprem-dc1
+  server: https://dc1.k8s.example.com:6443
+  provider: generic
+  vault:
+    namespace: platform
+  labels:
+    env: prod
+    site: dc1
+---
+# TENANT teamx, PROJECT appa. AppProject "teamx-appa", source namespace
+# "tenant-teamx-appa". Destination namespaces carry the "teamx-" tenant
+# prefix (new claims must; brownfield namespaces use the
+# example.com/tenant-deployable label instead).
+apiVersion: kro.run/v1alpha1
+kind: ArgoCDProject
+metadata:
+  name: teamx-appa
+  namespace: argocd
+spec:
+  tenant: teamx
+  name: appa
+  description: TeamX appA
+  destinations:
+    - in-cluster/teamx-appa-dev
+    - prod-east/teamx-appa-prod
+  sourceRepos:
+    - https://github.com/example-org/teamx-*
+  adminGroup: idp:teamx-admins
+  # Restores per-project blast radius on shared clusters (the global
+  # cluster credential is broad): Argo CD impersonates this remote SA
+  # when syncing this project's apps.
+  syncServiceAccount: argocd-sync-teamx-appa
+  # App-of-apps: Applications/ApplicationSets live at
+  # https://github.com/example-org/teamx-appa (path argo-apps/, the
+  # default). Everything after onboarding is a PR to that repo.
+  bootstrap:
+    repoUrl: https://github.com/example-org/teamx-appa.git
+---
+# Second project of the SAME tenant, sharing the prod-east cluster with
+# appa but claiming different namespaces.
+apiVersion: kro.run/v1alpha1
+kind: ArgoCDProject
+metadata:
+  name: teamx-appb
+  namespace: argocd
+spec:
+  tenant: teamx
+  name: appb
+  description: TeamX appB
+  destinations:
+    - prod-east/teamx-appb-prod
+  sourceRepos:
+    - https://github.com/example-org/teamx-*
+  adminGroup: idp:teamx-admins
+---
+# Repo for appa: team writes creds at kv/argocd/teamx/appa/repos/core in
+# THEIR Vault namespace; the rendered secret is project-scoped to
+# AppProject teamx-appa.
+apiVersion: kro.run/v1alpha1
+kind: ArgoCDProjectRepository
+metadata:
+  name: teamx-appa-core
+  namespace: argocd
+spec:
+  tenant: teamx
+  project: appa
+  name: core
+  url: https://github.com/example-org/teamx-appa.git
+  credType: https
+  vault:
+    namespace: teamx
+---
+# Credential template for the whole org prefix (NOT project-scoped in
+# Argo CD — only safe because the prefix is tenant-unique).
+apiVersion: kro.run/v1alpha1
+kind: ArgoCDProjectRepository
+metadata:
+  name: teamx-appa-org-creds
+  namespace: argocd
+spec:
+  tenant: teamx
+  project: appa
+  name: org-creds
+  url: https://github.com/example-org/teamx-
+  secretType: repo-creds
+  credType: https
+  vault:
+    namespace: teamx
