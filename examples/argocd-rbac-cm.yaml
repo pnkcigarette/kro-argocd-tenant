@@ -1,0 +1,30 @@
+---
+# Option A (default): STATIC Argo CD RBAC — written once, never touched
+# by onboarding.
+#
+# Global layer: every authenticated LDAP user gets metadata-level READ on
+# the Settings objects (projects/clusters/repos — "an idea of their
+# config"; credentials are never exposed, the API redacts secret
+# material). No applications/logs/exec globally: workload visibility is
+# granted per-project via AppProject roles (viewer/admin), which the
+# ArgoCDProject RGD renders with LDAP groups derived from
+# assigneeGroup + environment.
+#
+# If settings METADATA between teams ever becomes sensitive, switch to
+# Option B: remove policy.default below and deploy
+# platform-policies-rbac-generator.yaml, which maintains per-project
+# read grants in the policy.projects.csv key of this ConfigMap.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-rbac-cm
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: argocd
+data:
+  scopes: '[groups]'
+  policy.default: role:settings-view
+  policy.csv: |
+    p, role:settings-view, projects, get, *, allow
+    p, role:settings-view, clusters, get, *, allow
+    p, role:settings-view, repositories, get, *, allow

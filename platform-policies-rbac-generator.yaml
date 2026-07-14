@@ -1,0 +1,118 @@
+---
+# OPTION B (OPTIONAL — not part of the default apply): exact per-project
+# settings visibility in Argo CD RBAC.
+#
+# Deploy this INSTEAD of the policy.default line in
+# examples/argocd-rbac-cm.yaml when settings metadata between teams is
+# sensitive. It maintains the `policy.projects.csv` key of argocd-rbac-cm
+# (Argo CD concatenates any policy.<x>.csv key below policy.csv) as a
+# PURE FUNCTION of the current labeled AppProjects:
+#
+#   p, role:<unit>-viewer, projects, get, <unit>, allow
+#   p, role:<unit>-viewer, repositories, get, <unit>/*, allow
+#   g, <viewer-group>, role:<unit>-viewer
+#   g, <admin-group>, role:<unit>-viewer
+#
+# Level-triggered regeneration (mutate-existing on any AppProject
+# create/update/delete + on policy apply): deletes need no bookkeeping —
+# a removed project is simply absent from the list and its lines vanish.
+# The derived group names are read from the AppProject annotations
+# (example.com/viewer-group / admin-group) that the ArgoCDProject RGD
+# renders — no group derivation is duplicated here.
+#
+# Classic ClusterPolicy: mutate-existing (`targets:`) is not available in
+# the ValidatingPolicy-family CRDs.
+#
+# Limitation: per-project CLUSTER visibility lines are not generated
+# (clusters are global; per-URL grants would couple claims to RBAC) —
+# keep a static `p, role:..., clusters, get, *, allow` line in policy.csv
+# if cluster inventory should stay browsable, or omit it entirely.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: argocd-rbac-generator
+spec:
+  validationFailureAction: Audit
+  mutateExistingOnPolicyUpdate: true
+  background: false
+  rules:
+    - name: regenerate-project-rbac-csv
+      match:
+        any:
+          - resources:
+              kinds:
+                - argoproj.io/v1alpha1/AppProject
+              namespaces: ["argocd"]
+              operations: ["CREATE", "UPDATE", "DELETE"]
+              selector:
+                matchExpressions:
+                  - key: example.com/tenant
+                    operator: Exists
+      context:
+        - name: projList
+          apiCall:
+            urlPath: /apis/argoproj.io/v1alpha1/namespaces/argocd/appprojects
+            jmesPath: >-
+              items[?metadata.labels."example.com/tenant" &&
+                    metadata.annotations."example.com/viewer-group" &&
+                    metadata.annotations."example.com/admin-group"]
+        - name: policyCsv
+          variable:
+            jmesPath: >-
+              join(`"\n"`, map(&join(`"\n"`, [
+                join('', ['p, role:', metadata.name, '-viewer, projects, get, ', metadata.name, ', allow']),
+                join('', ['p, role:', metadata.name, '-viewer, repositories, get, ', metadata.name, '/*, allow']),
+                join('', ['g, ', metadata.annotations."example.com/viewer-group", ', role:', metadata.name, '-viewer']),
+                join('', ['g, ', metadata.annotations."example.com/admin-group", ', role:', metadata.name, '-viewer'])
+              ]), projList))
+      mutate:
+        targets:
+          - apiVersion: v1
+            kind: ConfigMap
+            name: argocd-rbac-cm
+            namespace: argocd
+        patchStrategicMerge:
+          data:
+            policy.projects.csv: '{{ policyCsv }}'
+---
+# RBAC for the generator: the background controller applies the
+# mutate-existing patches (ConfigMap update, scoped to argocd), and both
+# controllers need to read AppProjects.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kyverno-rbac-generator
+  namespace: argocd
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["argocd-rbac-cm"]
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kyverno-rbac-generator
+  namespace: argocd
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kyverno-rbac-generator
+subjects:
+  - kind: ServiceAccount
+    name: kyverno-background-controller
+    namespace: kyverno
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kyverno:aggregate-to-background-controller:appprojects
+  labels:
+    rbac.kyverno.io/aggregate-to-background-controller: "true"
+    app.kubernetes.io/part-of: kyverno
+    app.kubernetes.io/instance: kyverno
+    app.kubernetes.io/component: background-controller
+rules:
+  - apiGroups: ["argoproj.io"]
+    resources: ["appprojects"]
+    verbs: ["get", "list", "watch"]

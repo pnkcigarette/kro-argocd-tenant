@@ -134,9 +134,18 @@ spec:
     - name: sourceNamespaces
       expression: >-
         has(object.spec.sourceNamespaces) ? object.spec.sourceNamespaces : []
+    - name: destinations
+      expression: >-
+        has(object.spec.destinations) ? object.spec.destinations : []
     - name: projects
       expression: >-
         resource.List("kro.run/v1alpha1", "argocdprojects", "").items
+    - name: tenantLabel
+      expression: >-
+        variables.isProjectManaged ? object.metadata.labels['example.com/tenant'] : ''
+    - name: projectLabel
+      expression: >-
+        variables.isProjectManaged ? object.metadata.labels['example.com/project'] : ''
   validations:
     # Half-labeled is malformed — either both tenancy labels or neither.
     - expression: variables.hasTenant == variables.hasProject
@@ -176,6 +185,35 @@ spec:
       message: >-
         an AppProject may only list namespaces belonging to the project in
         its example.com/tenant + example.com/project labels
+    # DESTINATIONS must match the claims registry too. The claims policy
+    # runs on the ArgoCDProject CR, but the AppProject is the object Argo
+    # CD actually reads — so a direct AppProject edit could otherwise add
+    # a cross-tenant destination that the claims registry never saw
+    # (KRO reverts the drift, but this closes the window). Every
+    # destination namespace must be the project's own source namespace or
+    # a namespace the owning ArgoCDProject claims (match by namespace —
+    # claims are globally unique per namespace, so the cluster side is
+    # implied). Covers both the name-form and server-form in-cluster
+    # entries (same namespace); destinationServiceAccounts is a separate
+    # field. Transient: right after a claim change KRO re-renders the
+    # AppProject, and if Kyverno's informer hasn't yet seen the updated
+    # ArgoCDProject the apply is briefly denied and KRO retries to
+    # convergence — the same informer-lag we accept for claims.
+    - expression: >-
+        !variables.isProjectManaged ||
+        dyn(variables.destinations).all(d,
+          !has(d.namespace) ||
+          d.namespace == 'tenant-' + variables.tenantLabel + '-' + variables.projectLabel ||
+          dyn(variables.projects).exists(x,
+            x.spec.tenant == variables.tenantLabel &&
+            x.spec.name == variables.projectLabel &&
+            (has(x.spec.destinations) ? x.spec.destinations : [])
+              .exists(cd, cd.split('/')[1] == d.namespace)))
+      message: >-
+        an AppProject destination namespace must be the project's source
+        namespace or a namespace the owning ArgoCDProject claims — direct
+        AppProject destination edits that bypass the claim registry are
+        rejected
 ---
 # Protect the namespace boundary itself: tenant-* namespaces must carry
 # the label pair that binds them to their project — the binding policy is
@@ -312,6 +350,24 @@ spec:
          object.spec.bootstrap.repoUrl.startsWith('git@') ||
          object.spec.bootstrap.repoUrl.startsWith('ssh://'))
       message: bootstrap.repoUrl must be an https://, git@, or ssh:// URL
+    # Tool knobs are mutually exclusive: helmValueFiles forces the Helm
+    # tool, recurse forces the plain-directory tool.
+    - expression: >-
+        !has(object.spec.bootstrap) ||
+        !(has(object.spec.bootstrap.helmValueFiles) &&
+          object.spec.bootstrap.helmValueFiles.size() > 0 &&
+          has(object.spec.bootstrap.recurse) && object.spec.bootstrap.recurse)
+      message: >-
+        bootstrap.helmValueFiles and bootstrap.recurse are mutually
+        exclusive (helm chart vs plain-manifest directory)
+    # valueFiles are in-repo relative paths (Argo CD enforces the repo
+    # boundary; we reject the obviously-wrong shapes early).
+    - expression: >-
+        !has(object.spec.bootstrap) || !has(object.spec.bootstrap.helmValueFiles) ||
+        object.spec.bootstrap.helmValueFiles.all(v,
+          v != '' && !v.startsWith('/') && !v.contains('\\'))
+      message: >-
+        bootstrap.helmValueFiles entries must be non-empty relative paths
 ---
 # Destination and source namespaces are ownership claims. Clusters are
 # GLOBAL and registered exactly once per server, so the claim key is the
@@ -497,10 +553,27 @@ spec:
         ArgoCDProjectRepository spec.tenant/spec.project/spec.name are immutable
         (renaming orphans the repo secret) — delete and recreate instead
     # The vault block itself must be present — nested required= markers
-    # only apply when the parent object exists.
+    # only apply when the parent object exists. credType=none is the
+    # exception: metadata-only attachments have no Vault involvement at
+    # all, so the block is forbidden there (silent-ignore is a
+    # misconfiguration).
     - expression: >-
-        has(object.spec.vault) && object.spec.vault.namespace != ''
+        object.spec.credType == 'none' ||
+        (has(object.spec.vault) && object.spec.vault.namespace != '')
       message: vault.namespace (the team's Vault namespace) is required
+    - expression: >-
+        object.spec.credType != 'none' || !has(object.spec.vault)
+      message: vault.* may not be set when credType=none (metadata-only attachment)
+    # none is a project ATTACHMENT — meaningless for repo-creds
+    # templates, whose whole job is carrying the credential.
+    - expression: >-
+        object.spec.credType != 'none' || object.spec.secretType == 'repository'
+      message: credType=none is only usable with secretType=repository
+    - expression: >-
+        object.spec.credType != 'none' ||
+        object.spec.url.startsWith('https://') || object.spec.url.startsWith('oci://') ||
+        object.spec.url.startsWith('git@') || object.spec.url.startsWith('ssh://')
+      message: credType=none requires an https://, oci://, git@, or ssh:// url
     # One instance per (tenant, project, name).
     - expression: >-
         !dyn(variables.repoList).exists(r,
@@ -555,14 +628,27 @@ spec:
       expression: >-
         resource.List("kro.run/v1alpha1", "argocdclusters", "").items
   validations:
-    # name and server are the identity the claim registry keys on.
+    # name and server are the identity the claim registry keys on. name
+    # is always immutable. server is immutable with ONE sanctioned
+    # transition: migrating a credentialed cluster to argocd-agent in
+    # place (provider -> agent, server -> the synthetic URL). The name —
+    # and therefore every project claim/destination — is unchanged, so
+    # the migration is invisible to tenants. The reverse (agent ->
+    # credentialed) is NOT sanctioned: delete and re-register.
+    - expression: >-
+        request.operation != 'UPDATE' || object.spec.name == oldObject.spec.name
+      message: >-
+        ArgoCDCluster spec.name is immutable — delete and re-register to
+        change it
     - expression: >-
         request.operation != 'UPDATE' ||
-        (object.spec.name == oldObject.spec.name &&
-         object.spec.server == oldObject.spec.server)
+        object.spec.server == oldObject.spec.server ||
+        (object.spec.provider == 'agent' && oldObject.spec.provider != 'agent' &&
+         object.spec.server == 'https://' + object.spec.name + '.agent.internal')
       message: >-
-        ArgoCDCluster spec.name/spec.server are immutable — delete and
-        re-register to change them
+        ArgoCDCluster spec.server is immutable (the only in-place change
+        allowed is migrating to provider=agent with the synthetic
+        server) — delete and re-register otherwise
     # host:port only (no trailing slash/path): URL-format variance would
     # alias one physical cluster into two claim keys. Scoped to
     # CREATE-or-server-changed so a grandfathered bad value can't wedge
@@ -610,12 +696,37 @@ spec:
     - expression: >-
         object.spec.provider == 'generic' || !has(object.spec.vault)
       message: vault.* may only be set when provider=generic (eks/aks use ambient pod identity)
+    # agent clusters are registry-only: spec.name IS the agent name the
+    # principal routes AppProjects to (destination-based mapping); the
+    # server is a synthetic collision-free URL so one-per-server and
+    # immutability rules hold; no secret material of any kind here
+    # (argocd-agentctl owns the principal-side cluster secret, including
+    # generator labels).
+    - expression: >-
+        object.spec.provider != 'agent' ||
+        (has(object.spec.agent) && has(object.spec.agent.mode))
+      message: provider=agent requires agent.mode (managed or autonomous)
+    - expression: >-
+        object.spec.provider == 'agent' || !has(object.spec.agent)
+      message: agent.* may only be set when provider=agent
+    - expression: >-
+        object.spec.provider != 'agent' ||
+        object.spec.server == 'https://' + object.spec.name + '.agent.internal'
+      message: >-
+        agent clusters must use the synthetic server
+        https://<name>.agent.internal (agents dial out; the hub never
+        connects to this URL)
+    - expression: >-
+        object.spec.provider != 'agent' || !has(object.spec.labels)
+      message: >-
+        spec.labels are ignored for agent clusters (argocd-agentctl owns
+        the principal-side cluster secret) — set generator labels there
     # eks/aks API certs chain to the cluster's private CA.
     - expression: >-
-        object.spec.provider == 'generic' || object.spec.caData != ''
+        !(object.spec.provider in ['eks', 'aks']) || object.spec.caData != ''
       message: provider=eks/aks requires caData (base64 CA bundle of the target cluster)
     - expression: >-
-        object.spec.provider != 'generic' || object.spec.caData == ''
+        object.spec.provider in ['eks', 'aks'] || object.spec.caData == ''
       message: caData may only be set for eks/aks (generic carries its CA in the Vault config JSON)
     # User labels merge into the cluster secret (generator selectors);
     # reserved prefixes would let a registration spoof tenancy/identity
@@ -624,10 +735,11 @@ spec:
     - expression: >-
         !has(object.spec.labels) ||
         object.spec.labels.all(k,
-          !k.startsWith('argocd.argoproj.io/') && !k.startsWith('example.com/'))
+          !k.startsWith('argocd.argoproj.io/') && !k.startsWith('example.com/') &&
+          !k.startsWith('kro.run/'))
       message: >-
         spec.labels may not use reserved prefixes (argocd.argoproj.io/,
-        example.com/)
+        example.com/, kro.run/)
 ---
 # Referential integrity on DELETE (day-2 offboarding).
 #   - an ArgoCDProject can't be deleted while any ArgoCDProjectRepository of

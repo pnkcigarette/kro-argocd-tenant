@@ -44,6 +44,24 @@ spec:
     env: prod
     site: dc1
 ---
+# argocd-agent workload cluster (destination-based mapping):
+# REGISTRY-ONLY — no secret is rendered; `argocd-agentctl agent create
+# agent-east` owns the principal-side cluster secret and certs.
+# spec.name equals the agent name, which is what the principal matches
+# against AppProject destinations[].name to route projects. The server
+# is the mandatory synthetic URL (agents dial out; never dialed by hub).
+apiVersion: kro.run/v1alpha1
+kind: ArgoCDCluster
+metadata:
+  name: agent-east
+  namespace: argocd
+spec:
+  name: agent-east
+  server: https://agent-east.agent.internal
+  provider: agent
+  agent:
+    mode: managed
+---
 # TENANT teamx, PROJECT appa. AppProject "teamx-appa", source namespace
 # "tenant-teamx-appa". Destination namespaces carry the "teamx-" tenant
 # prefix (new claims must; brownfield namespaces use the
@@ -57,21 +75,30 @@ spec:
   tenant: teamx
   name: appa
   description: TeamX appA
+  # ITSM assignee group (recorded on the namespace as annotation
+  # assignee_group). environment=dev derives:
+  #   viewer: paas_appteamx    admin: paas_appteamx
+  assigneeGroup: APP_Team X
+  environment: dev
   destinations:
     - in-cluster/teamx-appa-dev
     - prod-east/teamx-appa-prod
   sourceRepos:
     - https://github.com/example-org/teamx-*
-  adminGroup: idp:teamx-admins
   # Restores per-project blast radius on shared clusters (the global
   # cluster credential is broad): Argo CD impersonates this remote SA
   # when syncing this project's apps.
   syncServiceAccount: argocd-sync-teamx-appa
-  # App-of-apps: Applications/ApplicationSets live at
-  # https://github.com/example-org/teamx-appa (path argo-apps/, the
-  # default). Everything after onboarding is a PR to that repo.
+  # App-of-apps: monorepo HELM chart with per-ENV overrides — one chart
+  # at argo-apps/ serves every env project; each project's bootstrap
+  # picks its env values file. (Omit helmValueFiles for plain-manifest /
+  # kustomize paths — Argo CD auto-detects; set recurse: true instead
+  # for plain manifests organized in subdirectories.)
   bootstrap:
     repoUrl: https://github.com/example-org/teamx-appa.git
+    helmValueFiles:
+      - values.yaml
+      - envs/dev.yaml
 ---
 # Second project of the SAME tenant, sharing the prod-east cluster with
 # appa but claiming different namespaces.
@@ -84,11 +111,20 @@ spec:
   tenant: teamx
   name: appb
   description: TeamX appB
+  # environment=prod derives viewer paas_appteamx and admin
+  # paas_emerid_appteamx_prod — but this project overrides the admin
+  # group for a one-off (override fields beat derivation when set).
+  assigneeGroup: APP_Team X
+  environment: prod
+  adminGroup: paas_special_appteamb_ops
   destinations:
     - prod-east/teamx-appb-prod
+    # Claim on the argocd-agent cluster: renders destinations[].name
+    # "agent-east", which the principal (destination-based mapping)
+    # matches to route this AppProject to that agent.
+    - agent-east/teamx-appb-edge
   sourceRepos:
     - https://github.com/example-org/teamx-*
-  adminGroup: idp:teamx-admins
 ---
 # Repo for appa: team writes creds at kv/argocd/teamx/appa/repos/core in
 # THEIR Vault namespace; the rendered secret is project-scoped to
@@ -106,6 +142,22 @@ spec:
   credType: https
   vault:
     namespace: teamx
+---
+# The SAME repo attached to a SECOND project (appb) as metadata-only:
+# credType=none renders a plain project-scoped entry with no credential
+# keys and no Vault involvement — creds resolve from the org-creds
+# repo-creds template below. One credential in Vault, N attachments.
+apiVersion: kro.run/v1alpha1
+kind: ArgoCDProjectRepository
+metadata:
+  name: teamx-appb-core
+  namespace: argocd
+spec:
+  tenant: teamx
+  project: appb
+  name: core
+  url: https://github.com/example-org/teamx-appa.git
+  credType: none
 ---
 # Credential template for the whole org prefix (NOT project-scoped in
 # Argo CD — only safe because the prefix is tenant-unique).

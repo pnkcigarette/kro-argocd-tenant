@@ -47,6 +47,18 @@ spec:
       name: string | required=true pattern="^[a-z0-9]([a-z0-9-]{0,28}[a-z0-9])?$"
       description: string | default=""
 
+      # SNOW ITSM assignee group, recorded verbatim (annotation on the
+      # source namespace) and used to derive the LDAP group names:
+      # "APP_Team X" normalizes to appteamx -> paas_appteamx etc.
+      # Charset restricted so normalization is total and the derived
+      # values are injection-proof in policy CSV.
+      assigneeGroup: string | required=true pattern="^[A-Za-z0-9_ ]{1,64}$"
+      # Environment of this project (Argo CD instances are split
+      # DEV/IT/QA, UAT, PROD; clusters never cross those breakouts).
+      # Drives the derived admin group: dev/it/qa -> paas_<ag>,
+      # uat -> paas_emerid_<ag>_nonprod, prod -> paas_emerid_<ag>_prod.
+      environment: string | required=true enum="dev,it,qa,uat,prod"
+
       # Additional source namespaces beyond the derived one. Must match
       # the tenant-* glob; label them with the project's tenant/project
       # labels at approval time so the binding policy covers them.
@@ -65,8 +77,12 @@ spec:
       # ArgoCDProjectRepository instances for this project.
       sourceRepos: '[]string'
 
-      # IdP group granted the project admin role + namespace RBAC.
-      adminGroup: string | default=""
+      # LDAP group OVERRIDES for one-offs. Empty (the default) means the
+      # group is DERIVED from assigneeGroup + environment per the rules
+      # above; set a value to use it verbatim. Charset excludes commas
+      # and whitespace (values flow into Argo CD policy strings).
+      adminGroup: string | default="" pattern="^[A-Za-z0-9:_./-]*$"
+      viewerGroup: string | default="" pattern="^[A-Za-z0-9:_./-]*$"
 
       # Cluster-scoped resources the project may manage, as "group/Kind".
       clusterResourceWhitelist: '[]string'
@@ -81,11 +97,24 @@ spec:
       # App-of-apps bootstrap: path in one of the project's repos
       # containing ONLY Application/ApplicationSet manifests. Set repoUrl
       # to enable. Argo CD auto-detects plain manifests / kustomize /
-      # helm at the path.
+      # helm at the path. Tool-specific knobs (mutually exclusive):
+      #
+      #   helmValueFiles — for app-of-apps HELM charts with per-ENV
+      #     overrides in a monorepo: paths are relative to `path` and may
+      #     climb within the repo (e.g. ["values.yaml",
+      #     "../envs/dev.yaml"]). Setting this renders an explicit
+      #     source.helm block (chart + env values), pairing with the
+      #     per-project `environment` so one monorepo chart serves all
+      #     env projects.
+      #   recurse — for PLAIN-manifest paths organized in subdirectories:
+      #     renders source.directory.recurse=true (declares the path is
+      #     plain manifests; do not set for helm/kustomize).
       bootstrap:
         repoUrl: string | default=""
         path: string | default="argo-apps"
         targetRevision: string | default="HEAD"
+        helmValueFiles: '[]string'
+        recurse: boolean | default=false
 
     # NOTE: KRO simple schema supports only field markers — no CEL
     # validation block. Per-item and cross-field rules live in
@@ -110,8 +139,12 @@ spec:
           labels:
             example.com/tenant: ${schema.spec.tenant}
             example.com/project: ${schema.spec.name}
+            example.com/environment: ${schema.spec.environment}
           annotations:
             example.com/app-project: ${appProject.metadata.name}
+            # ITSM traceability, verbatim (may contain spaces — hence an
+            # annotation, not a label).
+            assignee_group: ${schema.spec.assigneeGroup}
 
     - id: appProject
       template:
@@ -124,6 +157,15 @@ spec:
           labels:
             example.com/tenant: ${schema.spec.tenant}
             example.com/project: ${schema.spec.name}
+            example.com/environment: ${schema.spec.environment}
+          annotations:
+            # Machine-readable derived groups: the optional Option B RBAC
+            # generator (platform-policies-rbac-generator.yaml) reads
+            # these instead of re-deriving in JMESPath. Same expressions
+            # as the roles below.
+            assignee_group: ${schema.spec.assigneeGroup}
+            example.com/viewer-group: '${schema.spec.viewerGroup != "" ? schema.spec.viewerGroup : "paas_" + schema.spec.assigneeGroup.lowerAscii().replace("_", "").replace(" ", "")}'
+            example.com/admin-group: '${schema.spec.adminGroup != "" ? schema.spec.adminGroup : (schema.spec.environment in ["dev", "it", "qa"] ? "paas_" + schema.spec.assigneeGroup.lowerAscii().replace("_", "").replace(" ", "") : (schema.spec.environment == "uat" ? "paas_emerid_" + schema.spec.assigneeGroup.lowerAscii().replace("_", "").replace(" ", "") + "_nonprod" : "paas_emerid_" + schema.spec.assigneeGroup.lowerAscii().replace("_", "").replace(" ", "") + "_prod"))}'
         spec:
           description: ${schema.spec.description}
           sourceRepos: >-
@@ -162,23 +204,48 @@ spec:
               kind: LimitRange
           orphanedResources:
             warn: true
-          # Static role, CEL only on the groups list (a role with no
-          # groups is valid; an empty-string group is rejected by Argo).
+          # Two roles per the approved RBAC matrix. Static YAML with CEL
+          # only in values; the groups repeat the derivation expressions
+          # from the annotations above (KRO has no locals).
+          #
+          # viewer: read-only on this project's apps (+ logs — granted in
+          # DataDog too, accepted for UAT/PROD).
+          # admin ("limited write"): sync, resource actions, spec edits,
+          # override — deliberately NO create/delete (app lifecycle flows
+          # through the git bootstrap repo) and NO exec.
           roles:
-            - name: admin
-              description: Project admin
+            - name: viewer
+              description: Project read-only
               policies:
-                - p, proj:${schema.spec.tenant}-${schema.spec.name}:admin, applications, *, ${schema.spec.tenant}-${schema.spec.name}/*, allow
-                - p, proj:${schema.spec.tenant}-${schema.spec.name}:admin, applicationsets, *, ${schema.spec.tenant}-${schema.spec.name}/*, allow
-              groups: '${schema.spec.adminGroup == "" ? [] : [schema.spec.adminGroup]}'
+                - p, proj:${schema.spec.tenant}-${schema.spec.name}:viewer, applications, get, ${schema.spec.tenant}-${schema.spec.name}/*, allow
+                - p, proj:${schema.spec.tenant}-${schema.spec.name}:viewer, applicationsets, get, ${schema.spec.tenant}-${schema.spec.name}/*, allow
+                - p, proj:${schema.spec.tenant}-${schema.spec.name}:viewer, logs, get, ${schema.spec.tenant}-${schema.spec.name}/*, allow
+              groups: '${[schema.spec.viewerGroup != "" ? schema.spec.viewerGroup : "paas_" + schema.spec.assigneeGroup.lowerAscii().replace("_", "").replace(" ", "")]}'
+            - name: admin
+              description: Project admin (limited write)
+              policies:
+                - p, proj:${schema.spec.tenant}-${schema.spec.name}:admin, applications, get, ${schema.spec.tenant}-${schema.spec.name}/*, allow
+                - p, proj:${schema.spec.tenant}-${schema.spec.name}:admin, applications, sync, ${schema.spec.tenant}-${schema.spec.name}/*, allow
+                - p, proj:${schema.spec.tenant}-${schema.spec.name}:admin, applications, action/*, ${schema.spec.tenant}-${schema.spec.name}/*, allow
+                - p, proj:${schema.spec.tenant}-${schema.spec.name}:admin, applications, update, ${schema.spec.tenant}-${schema.spec.name}/*, allow
+                - p, proj:${schema.spec.tenant}-${schema.spec.name}:admin, applications, override, ${schema.spec.tenant}-${schema.spec.name}/*, allow
+                - p, proj:${schema.spec.tenant}-${schema.spec.name}:admin, applicationsets, get, ${schema.spec.tenant}-${schema.spec.name}/*, allow
+                - p, proj:${schema.spec.tenant}-${schema.spec.name}:admin, logs, get, ${schema.spec.tenant}-${schema.spec.name}/*, allow
+              groups: '${[schema.spec.adminGroup != "" ? schema.spec.adminGroup : (schema.spec.environment in ["dev", "it", "qa"] ? "paas_" + schema.spec.assigneeGroup.lowerAscii().replace("_", "").replace(" ", "") : (schema.spec.environment == "uat" ? "paas_emerid_" + schema.spec.assigneeGroup.lowerAscii().replace("_", "").replace(" ", "") + "_nonprod" : "paas_emerid_" + schema.spec.assigneeGroup.lowerAscii().replace("_", "").replace(" ", "") + "_prod"))]}'
 
-    # App-of-apps bootstrap. References sourceNamespace so it is created
-    # after the namespace (and therefore after the AppProject). If the
-    # project's repo creds haven't synced yet the app just sits in
-    # ComparisonError and self-heals when they land.
+    # App-of-apps bootstrap — three mutually exclusive variants
+    # (exclusivity policy-enforced). Each references sourceNamespace so
+    # it is created after the namespace (and therefore the AppProject).
+    # If repo creds haven't synced yet the app self-heals when they land.
+    #
+    # Variant 1: AUTO — bare source, Argo CD detects the tool
+    # (kustomization.yaml -> kustomize, Chart.yaml -> helm w/ default
+    # values, else plain dir non-recursive).
     - id: bootstrapApp
       includeWhen:
         - ${has(schema.spec.bootstrap) && schema.spec.bootstrap.repoUrl != ""}
+        - ${!has(schema.spec.bootstrap) || !has(schema.spec.bootstrap.helmValueFiles) || schema.spec.bootstrap.helmValueFiles.size() == 0}
+        - ${!has(schema.spec.bootstrap) || !schema.spec.bootstrap.recurse}
       template:
         apiVersion: argoproj.io/v1alpha1
         kind: Application
@@ -202,12 +269,76 @@ spec:
               prune: true
               selfHeal: true
 
+    # Variant 2: HELM with per-ENV value overrides (monorepo app-of-apps
+    # chart). Rendering source.helm forces the Helm tool — which is what
+    # setting helmValueFiles declares.
+    - id: bootstrapHelmApp
+      includeWhen:
+        - ${has(schema.spec.bootstrap) && schema.spec.bootstrap.repoUrl != ""}
+        - ${has(schema.spec.bootstrap) && has(schema.spec.bootstrap.helmValueFiles) && schema.spec.bootstrap.helmValueFiles.size() > 0}
+      template:
+        apiVersion: argoproj.io/v1alpha1
+        kind: Application
+        metadata:
+          name: bootstrap
+          namespace: ${sourceNamespace.metadata.name}
+          labels:
+            example.com/tenant: ${schema.spec.tenant}
+            example.com/project: ${schema.spec.name}
+        spec:
+          project: ${schema.spec.tenant}-${schema.spec.name}
+          source:
+            repoURL: ${schema.spec.bootstrap.repoUrl}
+            path: ${schema.spec.bootstrap.path}
+            targetRevision: ${schema.spec.bootstrap.targetRevision}
+            helm:
+              valueFiles: ${schema.spec.bootstrap.helmValueFiles}
+          destination:
+            server: https://kubernetes.default.svc
+            namespace: ${sourceNamespace.metadata.name}
+          syncPolicy:
+            automated:
+              prune: true
+              selfHeal: true
+
+    # Variant 3: PLAIN manifests in subdirectories. Rendering
+    # source.directory forces the plain-dir tool — which is what setting
+    # recurse declares.
+    - id: bootstrapRecurseApp
+      includeWhen:
+        - ${has(schema.spec.bootstrap) && schema.spec.bootstrap.repoUrl != ""}
+        - ${has(schema.spec.bootstrap) && schema.spec.bootstrap.recurse}
+        - ${!has(schema.spec.bootstrap) || !has(schema.spec.bootstrap.helmValueFiles) || schema.spec.bootstrap.helmValueFiles.size() == 0}
+      template:
+        apiVersion: argoproj.io/v1alpha1
+        kind: Application
+        metadata:
+          name: bootstrap
+          namespace: ${sourceNamespace.metadata.name}
+          labels:
+            example.com/tenant: ${schema.spec.tenant}
+            example.com/project: ${schema.spec.name}
+        spec:
+          project: ${schema.spec.tenant}-${schema.spec.name}
+          source:
+            repoURL: ${schema.spec.bootstrap.repoUrl}
+            path: ${schema.spec.bootstrap.path}
+            targetRevision: ${schema.spec.bootstrap.targetRevision}
+            directory:
+              recurse: true
+          destination:
+            server: https://kubernetes.default.svc
+            namespace: ${sourceNamespace.metadata.name}
+          syncPolicy:
+            automated:
+              prune: true
+              selfHeal: true
+
     # Project self-service inside the source namespace: manage
     # Applications/ApplicationSets only (break-glass once bootstrap is
-    # the paved road).
+    # the paved road). Always rendered now that a derived admin group
+    # always exists.
     - id: adminRole
-      includeWhen:
-        - ${schema.spec.adminGroup != ""}
       template:
         apiVersion: rbac.authorization.k8s.io/v1
         kind: Role
@@ -223,8 +354,6 @@ spec:
             verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 
     - id: adminBinding
-      includeWhen:
-        - ${schema.spec.adminGroup != ""}
       template:
         apiVersion: rbac.authorization.k8s.io/v1
         kind: RoleBinding
@@ -241,4 +370,6 @@ spec:
         subjects:
           - apiGroup: rbac.authorization.k8s.io
             kind: Group
-            name: ${schema.spec.adminGroup}
+            # Derived admin group, read from the AppProject annotation to
+            # avoid a fourth copy of the derivation expression.
+            name: ${appProject.metadata.annotations["example.com/admin-group"]}

@@ -13,7 +13,9 @@ apps onboards three projects sharing the same `tenant`.
 |---|---|---|
 | `rgd-argocd-project.yaml` | `ArgoCDProject` (one per unit) | source Namespace, AppProject, admin Role/RoleBinding, optional bootstrap Application |
 | `rgd-argocd-project-repository.yaml` | `ArgoCDProjectRepository` (one per repo / cred template) | VaultStaticSecret → project-scoped Argo CD repository secret |
-| `rgd-argocd-cluster.yaml` | `ArgoCDCluster` (one per physical cluster, **platform-registered, global**) | plain Secret (eks/aks) or VaultStaticSecret (generic) → shared Argo CD cluster secret |
+| `rgd-argocd-cluster.yaml` | `ArgoCDCluster` (one per physical cluster, **platform-registered, global**) | plain Secret (eks/aks), VaultStaticSecret (generic), or registry-only (agent) |
+| `examples/argocd-rbac-cm.yaml` | — | static Argo CD RBAC (Option A): global settings-read; see RBAC model |
+| `platform-policies-rbac-generator.yaml` | — | OPTIONAL Option B: per-project RBAC CSV generator (deploy later if needed) |
 
 Plus `platform-policies.yaml`, applied once — eight Kyverno
 `ValidatingPolicy` resources (`policies.kyverno.io/v1`, verified on
@@ -32,7 +34,14 @@ instances; plain list *values* pass straight through.
    Application/ApplicationSet manifests from `repoUrl:path` (default path
    `argo-apps`) into the source namespace. Argo CD auto-detects plain
    manifests / kustomize / helm at that path, so the platform never
-   dictates app tooling. From then on, adding an app = a PR to the team's
+   dictates app tooling. Two opt-in tool knobs (mutually exclusive):
+   `bootstrap.helmValueFiles` for **monorepo app-of-apps Helm charts with
+   per-ENV overrides** — one chart serves every env project, each
+   project's bootstrap selects its env values (e.g. `["values.yaml",
+   "envs/dev.yaml"]`, relative paths within the repo) — and
+   `bootstrap.recurse: true` for plain-manifest paths organized in
+   subdirectories. Omit both for kustomize or single-dir manifests
+   (auto-detect). From then on, adding an app = a PR to the team's
    repo; the namespace Role is break-glass.
 3. The team writes repo creds into **their** Vault namespace at
    `<mount>/<pathPrefix>/<tenant>/<project>/repos/<name>`
@@ -78,6 +87,40 @@ tuples built *only* from validated claims — are the per-project gate.
 - **Race detector**: admission reads Kyverno's informer cache, so
   near-simultaneous writes can race; claim policies also run in
   background mode and surface conflicts in PolicyReports.
+- **argocd-agent clusters (`provider: agent`)**: workload clusters
+  connected via [argocd-agent](https://argocd-agent.readthedocs.io/)
+  with **destination-based mapping** register here too — registry-only
+  (no secret is rendered; `argocd-agentctl agent create` owns the
+  principal-side cluster secret, certs, and any generator labels).
+  `spec.name` MUST equal the agent name: the principal routes an
+  AppProject to agents matching `.spec.destinations[].name`, and our
+  claim-built, name-form destinations are exactly that — a project
+  claiming `agent-east/teamx-appb-edge` gets its AppProject shipped to
+  agent-east, where the preserved `sourceNamespaces` then bound app
+  placement. `server` is the mandatory synthetic
+  `https://<name>.agent.internal` (agents dial out; never dialed) so the
+  one-per-server and immutability invariants hold unchanged, and claims,
+  existence checks, and the referential delete-guard all apply to agent
+  clusters exactly as to credentialed ones.
+
+### Cluster provider spec matrix
+
+| provider | required spec | forbidden spec | renders |
+|---|---|---|---|
+| `eks` | `name`, `server` (real API URL), `caData`, `eks.clusterName`, `eks.roleARN` | `aks`, `vault`, `agent` | plain Secret (IAM auth) |
+| `aks` | `name`, `server` (real API URL), `caData`, `aks.environment` | `eks`, `vault`, `agent` | plain Secret (workload identity) |
+| `generic` | `name`, `server` (real API URL), `vault.namespace` | `caData`, `eks`, `aks`, `agent` | VaultStaticSecret |
+| `agent` | `name` (= agent name), `server` = `https://<name>.agent.internal`, `agent.mode` | `caData`, `eks`, `aks`, `vault`, `labels` | **nothing** (registry-only) |
+
+**Default → agent migration is a one-line, in-place, tenant-invisible
+change.** Clusters onboard credentialed by default; to move one behind
+argocd-agent later, update the same instance: `provider: agent`, `server`
+to the synthetic URL, drop the credential block, add `agent.mode`. This
+is the ONE sanctioned `server` mutation (policy-enforced); KRO prunes the
+old credential secret automatically. `spec.name` — and therefore every
+project's claims and destinations — is unchanged, so tenants notice
+nothing. The reverse (agent → credentialed) is not sanctioned in place:
+delete and re-register.
 
 ## Project restriction (the tenancy boundary)
 
@@ -87,7 +130,12 @@ tuples built *only* from validated claims — are the per-project gate.
   namespace is always appended so the bootstrap app-of-apps works.
 - **Repository secrets** carry `project: <tenant>-<name>` — usable only
   by that AppProject. (`repo-creds` templates are NOT project-scoped in
-  Argo CD; only use tenant-unique URL prefixes.)
+  Argo CD; only use tenant-unique URL prefixes.) Argo CD project-scoped
+  repo entries are 1:1 with an AppProject, so attaching the same URL to
+  a second project is a second lightweight instance — use
+  **`credType: none`** for it: a metadata-only entry (no credentials, no
+  Vault) whose creds resolve from the tenant's repo-creds template. One
+  credential in Vault, N project attachments.
 - **`argocd-project-binding`**: any Application/ApplicationSet in a
   namespace labeled `example.com/tenant` + `example.com/project` must set
   `spec.project` to `<tenant>-<project>` — readable failure at admission;
@@ -97,6 +145,48 @@ tuples built *only* from validated claims — are the per-project gate.
   unlabeled/mislabeled namespace can't evade the label-matched binding.
 - **AppProject guard**: no glob sourceNamespaces anywhere; labeled
   AppProjects may only list namespaces belonging to their own label pair.
+
+## RBAC model (LDAP groups)
+
+Two layers:
+
+- **Global (`examples/argocd-rbac-cm.yaml`, static — Option A)**: every
+  authenticated user gets metadata-level read on Settings objects
+  (projects/clusters/repos specs and status; never credentials). No
+  applications/logs globally.
+- **Per-project (AppProject roles, rendered by the RGD)**: `viewer`
+  (applications/applicationsets/logs get) and `admin` ("limited write":
+  get, sync, action/*, update, override + logs — deliberately NO
+  create/delete, app lifecycle flows through the bootstrap repo, and NO
+  exec), both scoped `<tenant>-<name>/*`.
+
+Groups are **derived** from `assigneeGroup` (SNOW ITSM, recorded
+verbatim as the `assignee_group` annotation on the source namespace) and
+`environment`. Normalization: lowercase, strip `_` and spaces —
+`"APP_Team X"` → `appteamx`:
+
+| environment | viewer | admin |
+|---|---|---|
+| dev / it / qa | `paas_appteamx` | `paas_appteamx` |
+| uat | `paas_appteamx` | `paas_emerid_appteamx_nonprod` |
+| prod | `paas_appteamx` | `paas_emerid_appteamx_prod` |
+
+`viewerGroup`/`adminGroup` are one-off OVERRIDES: empty (default) means
+derived; set means used verbatim (charset excludes commas/whitespace —
+values flow into policy strings). The derived values are also published
+as `example.com/viewer-group` / `example.com/admin-group` annotations on
+the AppProject for machine consumers. Environments never share clusters
+outside the DEV/IT/QA, UAT, PROD breakouts, so a project's single
+`environment` is always accurate.
+
+**Option B (deploy later if settings metadata becomes sensitive):**
+`platform-policies-rbac-generator.yaml` — a Kyverno mutate-existing
+ClusterPolicy that maintains `policy.projects.csv` in `argocd-rbac-cm`
+as a pure function of the labeled AppProjects (per-project
+`projects get` + `repositories get` viewer roles bound to the annotated
+groups). Level-triggered: create/update/delete of a project regenerates
+the key; no add/remove bookkeeping. Swap `policy.default` out of the
+static CM when deploying it. Verified live incl. removal-on-delete.
 
 ## Labels (ownership rollup)
 
@@ -130,6 +220,41 @@ claim registry (`ArgoCDProject` destinations).
   violations instead of blocking.
 - **Removing a claim** releases the namespace record but does not delete
   the namespace on the target cluster; clean up out of band.
+- **Changing `environment` (or `assigneeGroup` / the group overrides)
+  rotates derived RBAC in place.** These are mutable; editing them
+  re-derives the AppProject viewer/admin groups on the next reconcile
+  (correct — supports a project reassignment) but silently changes *who
+  has access*. Treat as a controlled operation: review the derived
+  groups after the change. If you instead want an environment to be
+  fixed for a project's life, model it as a separate project
+  (`teamx-appa-prod` vs `teamx-appa-dev`) rather than mutating one.
+
+## Enforcement surfaces (what's guarded where)
+
+The tenancy boundary is enforced on **both** the KRO CRs and the objects
+Argo CD actually reads:
+
+- **CR path** (`ArgoCDProject` etc.): claims uniqueness, cluster
+  existence, prefix/immutability — `argocd-project-claims` +
+  `argocd-project-destination-guard`.
+- **Effective-object path** (the rendered AppProject): `sourceNamespaces`
+  AND `destinations` are re-validated against the owning project's claims
+  by `argocd-appproject-guard` — so a direct AppProject edit that widens
+  destinations to another tenant is denied at admission, not merely
+  reverted by KRO drift-reconciliation.
+
+**Platform hardening prereqs (outside these RGDs):** `argocd-project-binding`
+matches only namespaces labeled `example.com/tenant`+`example.com/project`,
+so Applications created **in the `argocd` namespace itself** are not
+covered by it — they are backstopped only by Argo CD's `sourceNamespaces`
+and by the stock `default` AppProject. Tenants have no RBAC in `argocd`,
+so this isn't tenant-reachable, but as standard Argo CD hardening you
+should (a) lock down the `default` project (narrow its `destinations` /
+`sourceNamespaces`, or delete it) and (b) restrict who can create
+Applications in the `argocd` namespace. Rendered repo/cluster **Secrets**'
+`project` field is likewise enforced on the CR + kept correct by KRO
+drift-reconciliation, not admission-guarded on the Secret itself (same
+direct-edit class as AppProject destinations; not tenant-reachable).
 
 ## Prerequisites / caveats
 
@@ -186,7 +311,10 @@ run Kyverno's admission controller HA (≥2 replicas).
 
 ## Tests
 
-`tests/policy-tests.sh` — deny/allow matrix (26 checks) covering claims,
+`tests/policy-tests.sh` — deny/allow matrix (47 checks) covering claims,
 sharing, squatting, brownfield, identity immutability, offboarding order,
-bootstrap rendering, and label merging. Asserts deny *reasons*, cleans up
+bootstrap rendering (auto/helm/recurse), label merging, LDAP group
+derivation/override, CSV-injection denial, agent clusters, credType=none
+attachment, the credentialed→agent migration, and direct-AppProject-edit
+enforcement. Asserts deny *reasons*, cleans up
 after itself, safe to re-run back-to-back.

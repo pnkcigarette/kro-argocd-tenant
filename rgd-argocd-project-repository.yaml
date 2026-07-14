@@ -9,7 +9,7 @@
 #     sshPrivateKey              (ssh)
 #
 # A VaultStaticSecret syncs that path into an Argo CD secret. Exactly one
-# of four variants materializes (includeWhen on secretType x credType) so
+# of five variants materializes (includeWhen on secretType x credType) so
 # each secret carries only the keys that apply.
 #
 #   secretType=repository -> project-scoped repo entry (data.project =
@@ -19,6 +19,10 @@
 #     URL prefix. NOTE: repo-creds are NOT project-scoped in Argo CD —
 #     any project whose sourceRepos matches a URL under the prefix gets
 #     these creds. Only use prefixes unique to the tenant/project.
+#   credType=none (repository only) -> metadata-only attachment, plain
+#     Secret, no Vault: creds resolve from the tenant's repo-creds
+#     template. Use it to attach an already-credentialed URL to a second
+#     project without duplicating credentials.
 apiVersion: kro.run/v1alpha1
 kind: ResourceGraphDefinition
 metadata:
@@ -51,8 +55,15 @@ spec:
         pathPrefix: string | default="argocd"
         refreshAfter: string | default="60s" pattern="^[0-9]+(s|m|h)$"
 
-      # Which credential shape lives at the Vault path.
-      credType: string | default="https" enum="https,ssh"
+      # Which credential shape lives at the Vault path — or "none" for a
+      # METADATA-ONLY project attachment: no credentials, no Vault block.
+      # Argo CD project-scoped repo entries are 1:1 with an AppProject,
+      # so attaching the same URL to a second project means a second
+      # (lightweight) entry; with credType=none that entry carries no
+      # secret material and credentials resolve from the tenant's
+      # matching repo-creds template (tenant-unique URL prefix). One
+      # credential in Vault, N project attachments.
+      credType: string | default="https" enum="https,ssh,none"
 
     # NOTE: cross-field rules (credType/url agreement, oci modeling,
     # vault presence, identity immutability, dup checks) live in
@@ -257,3 +268,33 @@ spec:
                   text: ${schema.spec.repoType}
                 sshPrivateKey:
                   text: '{{- get .Secrets "sshPrivateKey" -}}'
+
+    # ------------------------------------------------------------------
+    # repository + none — metadata-only attachment: a plain Secret with
+    # no credential keys and NO Vault involvement. Credentials resolve
+    # from the tenant's matching repo-creds template. This is the
+    # "add an existing repo to a second project" path.
+    # ------------------------------------------------------------------
+    - id: repoNone
+      includeWhen:
+        - ${schema.spec.secretType == "repository"}
+        - ${schema.spec.credType == "none"}
+      template:
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: repo-${schema.spec.tenant}-${schema.spec.project}-${schema.spec.name}
+          namespace: argocd
+          labels:
+            argocd.argoproj.io/secret-type: repository
+            example.com/tenant: ${schema.spec.tenant}
+            example.com/project: ${schema.spec.project}
+        type: Opaque
+        stringData:
+          name: ${schema.spec.tenant}-${schema.spec.project}-${schema.spec.name}
+          url: ${schema.spec.url}
+          type: ${schema.spec.repoType}
+          enableOCI: ${string(schema.spec.enableOCI)}
+          # Hard project scoping: this entry attaches the URL to exactly
+          # this AppProject.
+          project: ${schema.spec.tenant}-${schema.spec.project}

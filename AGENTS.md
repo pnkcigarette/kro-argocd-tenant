@@ -32,7 +32,9 @@ CRDs, VSO main CRDs. Re-verify before assuming on other versions.
 - **KRO refuses to TIGHTEN a validation on an existing RGD** ("breaking
   changes detected" → RGD Inactive). Tighter constraints go in a Kyverno
   field-guard instead (that's why cluster `server` host:port lives in
-  policy, not the RGD pattern).
+  policy, not the RGD pattern). LOOSENING is accepted in place (verified:
+  widening the provider enum and adding an optional block applied
+  cleanly); adding REQUIRED fields is breaking → delete/recreate.
 - **Deleting an RGD does NOT delete its CRD or instances** — they orphan,
   and the instances keep a `kro.run/finalizer` no controller will ever
   remove. Migrations must delete the CRDs explicitly and strip stranded
@@ -106,6 +108,19 @@ CRDs, VSO main CRDs. Re-verify before assuming on other versions.
 - When policies list OTHER instances, `has()`-guard optional fields and
   shape-filter before indexing — one malformed legacy object must not
   error out everyone's admission.
+- **Guard the object Argo CD READS, not only the CR.** The claim registry
+  runs on `ArgoCDProject`, but the enforcement object is the rendered
+  AppProject — `argocd-appproject-guard` therefore re-validates BOTH
+  `sourceNamespaces` and `destinations` against the owning project's
+  claims, so a direct AppProject edit can't widen access in the window
+  before KRO reverts drift. When adding any CR-enforced constraint, ask
+  whether the rendered effective object needs the same guard. Known
+  residuals (accepted, not tenant-reachable — tenants have no argocd-ns
+  RBAC): rendered repo/cluster Secrets' `project` field is CR-enforced +
+  KRO-reverted only, not admission-guarded on the Secret; and the
+  appproject-destination guard has a transient (KRO re-renders the
+  AppProject on a claim change and may be briefly denied until Kyverno's
+  informer sees the updated ArgoCDProject — KRO retries to convergence).
 
 ## Tenancy invariants — do not weaken
 
@@ -125,6 +140,14 @@ CRDs, VSO main CRDs. Re-verify before assuming on other versions.
   normalized `server` are unique and immutable. That 1:1 mapping is what
   lets claims compare by name with no URL canonicalization. Destination
   clusters must exist at claim time.
+- **argocd-agent clusters** (`provider: agent`, destination-based
+  mapping): registry-only — the RGD renders ZERO resources (a
+  zero-resource KRO instance goes ACTIVE; verified). spec.name == agent
+  name (the principal routes AppProjects by destinations[].name, which
+  our name-form destinations already are). server MUST be the synthetic
+  `https://<name>.agent.internal` (policy-enforced) so one-per-server /
+  immutability hold; caData/vault/eks/aks/labels are all forbidden
+  (agentctl owns the principal-side secret, including generator labels).
 - The global cluster credential is broad — projects should set
   `syncServiceAccount` (AppProject `destinationServiceAccounts`) for
   remote blast-radius. Cluster `labels` merge with platform keys winning;
@@ -134,9 +157,38 @@ CRDs, VSO main CRDs. Re-verify before assuming on other versions.
   KRO prune-and-recreate, destroying namespaces/workloads/secrets.
 - Repository secrets carry `project: <tenant>-<name>`; `repo-creds`
   are NOT project-scoped in Argo CD — tenant-unique URL prefixes only.
+  Project-scoped repo entries are 1:1 with an AppProject (single-valued
+  `project` field) — same-URL-in-second-project = a second instance with
+  `credType: none` (metadata-only plain Secret, vault block FORBIDDEN,
+  repository secretType only; creds resolve from the tenant repo-creds
+  template). Five repo variants total.
+- Cluster `server` immutability has ONE sanctioned in-place transition:
+  credentialed -> agent (provider=agent + synthetic server together);
+  name unchanged so claims/destinations are untouched and KRO prunes the
+  old secret. Reverse = delete/recreate. Don't add other transitions
+  without re-checking the claim registry assumptions.
 - Every rendered resource carries the `example.com/tenant` +
   `example.com/project` label pair (rollup queries + teardown selectors);
-  clusters carry `example.com/cluster` instead.
+  clusters carry `example.com/cluster` instead. Namespaces/AppProjects
+  also carry `example.com/environment`.
+- **LDAP group derivation** lives in the project RGD (CEL `lowerAscii` +
+  `replace` — both verified in KRO's env): assigneeGroup + environment →
+  paas_* groups per the README matrix; `viewerGroup`/`adminGroup` empty
+  = derived, set = verbatim override. Anything flowing into Argo policy
+  strings (assigneeGroup, the override fields) is charset-restricted at
+  the schema (no commas/newlines — CSV injection). The derived groups
+  are published as AppProject annotations (`example.com/viewer-group`,
+  `example.com/admin-group`) — the Option B RBAC generator reads those
+  instead of re-deriving in JMESPath; keep annotation and role
+  expressions in sync.
+- Argo RBAC split: static rbac-cm (Option A, examples/) for global
+  settings-read; AppProject roles for all app rights. The OPTIONAL
+  Option B generator (`platform-policies-rbac-generator.yaml`, classic
+  ClusterPolicy — mutate-existing has no VP equivalent) regenerates
+  `policy.projects.csv` level-triggered from AppProjects; it is NOT part
+  of the default apply or the test suite baseline. Adding REQUIRED
+  schema fields is a breaking RGD change → delete/recreate migration
+  (same runbook as pattern tightening).
 
 ## Known limitations (accepted for MVP)
 
@@ -148,6 +200,12 @@ CRDs, VSO main CRDs. Re-verify before assuming on other versions.
   (background eval), not auto-resolved.
 - Bootstrap path contents are convention (Application manifests only),
   not enforced.
+- Bootstrap renders as THREE mutually exclusive Application variants
+  (auto / helm-with-valueFiles / directory-recurse) because rendering a
+  `source.helm` or `source.directory` block FORCES that tool and defeats
+  Argo CD auto-detection — never merge them into one template with
+  empty blocks. Exclusivity of the knobs is policy-enforced; valueFiles
+  are relative in-repo paths (Argo CD enforces the repo boundary).
 
 ## Testing changes
 

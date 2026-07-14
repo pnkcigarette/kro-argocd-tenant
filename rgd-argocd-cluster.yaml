@@ -22,6 +22,19 @@
 #   generic -> VaultStaticSecret; the PLATFORM writes connection config at
 #                <mount>/<pathPrefix>/clusters/<name>  (key "config":
 #                {"bearerToken": ..., "tlsClientConfig": {...}})
+#   agent   -> REGISTRY-ONLY: renders NO secret. The cluster is a
+#              workload cluster connected via argocd-agent
+#              (destination-based mapping); `argocd-agentctl agent
+#              create` owns the real principal-side cluster secret and
+#              certs. Registering it here gives the claim registry the
+#              name (spec.name MUST equal the agent name — that is what
+#              the principal matches against AppProject
+#              .spec.destinations[].name to route projects), plus
+#              existence/dup/referential guarantees. server is the
+#              synthetic, collision-free https://<name>.agent.internal
+#              (agents dial OUT to the principal; the hub never dials
+#              this URL) so the one-per-server and immutability rules
+#              hold unchanged.
 #
 # eks/aks API servers present certs signed by the cluster's own CA, so
 # caData (base64 CA bundle) is required for those providers; generic
@@ -50,7 +63,7 @@ spec:
       # Immutable (policy-enforced; the claims registry keys on the
       # name->server mapping).
       server: string | required=true pattern="^https://.+$"
-      provider: string | default="generic" enum="eks,aks,generic"
+      provider: string | default="generic" enum="eks,aks,generic,agent"
 
       # Base64 CA bundle of the target API server. Required for eks/aks;
       # must be absent/empty for generic (CA travels in the Vault JSON).
@@ -77,6 +90,11 @@ spec:
       # instance's stored spec).
       aks:
         environment: string | enum="AzurePublicCloud,AzureUSGovernmentCloud,AzureChinaCloud"
+
+      # provider=agent only (block required then; forbidden otherwise).
+      # Informational: how the argocd-agent on this cluster runs.
+      agent:
+        mode: string | enum="managed,autonomous"
 
       # provider=generic only (block required then; forbidden otherwise).
       vault:
