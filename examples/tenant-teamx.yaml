@@ -159,16 +159,19 @@ spec:
   url: https://github.com/example-org/teamx-appa.git
   credType: none
 ---
-# Credential template for the whole org prefix (NOT project-scoped in
-# Argo CD — only safe because the prefix is tenant-unique).
+# TENANT-level credential template for the whole org prefix (NOT
+# project-scoped in Argo CD — serves every teamx project whose sourceRepos
+# match the prefix; only safe because the prefix is tenant-unique). NO
+# project field: it's a tenant asset, not tied to any one project's
+# lifecycle. Creds at kv/argocd/teamx/repo-creds/org-creds; secret
+# repo-creds-teamx-org-creds.
 apiVersion: kro.run/v1alpha1
 kind: ArgoCDProjectRepository
 metadata:
-  name: teamx-appa-org-creds
+  name: teamx-org-creds
   namespace: argocd
 spec:
   tenant: teamx
-  project: appa
   name: org-creds
   url: https://github.com/example-org/teamx-
   secretType: repo-creds

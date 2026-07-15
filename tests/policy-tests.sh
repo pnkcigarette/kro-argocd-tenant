@@ -37,9 +37,9 @@ t() { # t <DENY|ALLOW> <name> <expected-deny-substring> ; manifest on stdin
 cleanup() {
   # Children before projects (referential guard); projects before
   # clusters they reference.
-  kubectl delete argocdprojectrepositories t-repo -n argocd --ignore-not-found --wait=false >/dev/null 2>&1
+  kubectl delete argocdprojectrepositories t-repo rc-creds -n argocd --ignore-not-found --wait=false >/dev/null 2>&1
   sleep 1
-  kubectl delete argocdprojects fraud-p claim-p ghost-p squat-p brown-p src-p ren-p del-p dup-p boot-p -n argocd --ignore-not-found --wait=false >/dev/null 2>&1
+  kubectl delete argocdprojects fraud-p claim-p ghost-p squat-p brown-p src-p ren-p del-p dup-p boot-p rcp-p -n argocd --ignore-not-found --wait=false >/dev/null 2>&1
   kubectl delete argocdclusters dup-a dup-b legacy-badsrv agent-bad mig-c -n argocd --ignore-not-found --wait=false >/dev/null 2>&1
   kubectl delete application legit -n tenant-teamx-appa --ignore-not-found >/dev/null 2>&1
   kubectl delete ns "$SCRATCH_NS" tenant-labeltest --ignore-not-found --wait=false >/dev/null 2>&1
@@ -322,7 +322,7 @@ if kubectl delete argocdprojects del-p -n argocd >/dev/null 2>&1; then
 else
   echo "PASS (denied) offboard-order-project-first"; PASS=$((PASS+1))
 fi
-kubectl delete argocdprojectrepositories t-repo -n argocd >/dev/null 2>&1
+kubectl delete argocdprojectrepositories t-repo rc-creds -n argocd >/dev/null 2>&1
 sleep 2
 if kubectl delete argocdprojects del-p -n argocd >/dev/null 2>&1; then
   echo "PASS (allowed) offboard-order-children-first"; PASS=$((PASS+1))
@@ -498,7 +498,7 @@ t DENY none-with-repo-creds "only usable with secretType=repository" <<'EOF'
 apiVersion: kro.run/v1alpha1
 kind: ArgoCDProjectRepository
 metadata: {name: t-repo, namespace: argocd}
-spec: {tenant: teamx, project: appa, name: badnone, url: "https://github.com/x/y.git", secretType: repo-creds, credType: none}
+spec: {tenant: teamx, name: badnone, url: "https://github.com/x/y.git", secretType: repo-creds, credType: none}
 EOF
 t DENY none-with-vault "may not be set when credType=none" <<'EOF'
 apiVersion: kro.run/v1alpha1
@@ -506,6 +506,50 @@ kind: ArgoCDProjectRepository
 metadata: {name: t-repo, namespace: argocd}
 spec: {tenant: teamx, project: appa, name: badnone, url: "https://github.com/x/y.git", credType: none, vault: {namespace: teamx}}
 EOF
+
+echo "=== 29b. repo-creds is TENANT-scoped (no project) ==="
+# baseline teamx-org-creds (repo-creds, no project) renders a tenant-level
+# secret with tenant label and NO project label.
+LBL=$(kubectl get vaultstaticsecret repo-creds-teamx-org-creds -n argocd -o jsonpath='{.metadata.labels.example\.com/tenant}|{.metadata.labels.example\.com/project}' 2>/dev/null)
+if [ "$LBL" = "teamx|" ]; then
+  echo "PASS (allowed) repo-creds-tenant-scoped-render"; PASS=$((PASS+1))
+else
+  echo "FAIL repo-creds-tenant-scoped-render: labels='$LBL' (want tenant=teamx, no project)"; FAIL=$((FAIL+1))
+fi
+t DENY repo-creds-with-project "may not be set for secretType=repo-creds" <<'EOF'
+apiVersion: kro.run/v1alpha1
+kind: ArgoCDProjectRepository
+metadata: {name: t-repo, namespace: argocd}
+spec: {tenant: teamx, project: appa, name: badcreds, url: "https://github.com/x/y.git", secretType: repo-creds, credType: https, vault: {namespace: teamx}}
+EOF
+t DENY repository-without-project "requires spec.project" <<'EOF'
+apiVersion: kro.run/v1alpha1
+kind: ArgoCDProjectRepository
+metadata: {name: t-repo, namespace: argocd}
+spec: {tenant: teamx, name: noproj, url: "https://github.com/x/y.git", credType: https, vault: {namespace: teamx}}
+EOF
+
+echo "=== 29c. tenant repo-creds does NOT block deleting a project ==="
+# A project whose ONLY same-tenant repo is a tenant-level repo-creds must
+# still be deletable (repo-creds is not that project's child).
+kubectl apply -f - >/dev/null 2>&1 <<'EOF'
+apiVersion: kro.run/v1alpha1
+kind: ArgoCDProject
+metadata: {name: rcp-p, namespace: argocd}
+spec: {assigneeGroup: Test Team, environment: dev, tenant: rcten, name: unit, destinations: ["in-cluster/rcten-unit-dev"]}
+---
+apiVersion: kro.run/v1alpha1
+kind: ArgoCDProjectRepository
+metadata: {name: rc-creds, namespace: argocd}
+spec: {tenant: rcten, name: shared, url: "https://github.com/rc/x-", secretType: repo-creds, credType: https, vault: {namespace: rcten}}
+EOF
+sleep 4
+if kubectl delete argocdprojects rcp-p -n argocd >/dev/null 2>&1; then
+  echo "PASS (allowed) repo-creds-does-not-block-project-delete"; PASS=$((PASS+1))
+else
+  echo "FAIL repo-creds-does-not-block-project-delete: project delete was blocked by a tenant repo-creds"; FAIL=$((FAIL+1))
+fi
+kubectl delete argocdprojectrepositories rc-creds -n argocd --wait=false >/dev/null 2>&1
 
 echo "=== 30. one-way in-place migration: credentialed cluster -> agent ==="
 kubectl apply -f - >/dev/null 2>&1 <<'EOF'

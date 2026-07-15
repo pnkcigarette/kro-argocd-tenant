@@ -1,10 +1,12 @@
 ---
 # ResourceGraphDefinition: ArgoCDProjectRepository
 #
-# One instance per repo (or per credential template) for a project.
-# The team writes creds into their Vault namespace at the agreed path:
+# A repo entry (per project) OR a tenant-level credential template.
+# The team writes creds into their Vault namespace; the path depends on
+# scope:
 #
-#   <mount>/<pathPrefix>/<tenant>/<project>/repos/<name>
+#   repository (project-scoped):  <mount>/<pathPrefix>/<tenant>/<project>/repos/<name>
+#   repo-creds (tenant-scoped):   <mount>/<pathPrefix>/<tenant>/repo-creds/<name>
 #     username / password        (https)
 #     sshPrivateKey              (ssh)
 #
@@ -12,13 +14,16 @@
 # of five variants materializes (includeWhen on secretType x credType) so
 # each secret carries only the keys that apply.
 #
-#   secretType=repository -> project-scoped repo entry (data.project =
-#     <tenant>-<project>): even if a URL glob in some other AppProject
-#     matched it, the credential is only usable by this project.
-#   secretType=repo-creds -> credential template for every repo under the
-#     URL prefix. NOTE: repo-creds are NOT project-scoped in Argo CD —
-#     any project whose sourceRepos matches a URL under the prefix gets
-#     these creds. Only use prefixes unique to the tenant/project.
+#   secretType=repository -> PROJECT-scoped repo entry (data.project =
+#     <tenant>-<project>, project REQUIRED): even if a URL glob in some
+#     other AppProject matched it, the credential is only usable by this
+#     project. Secret repo-<tenant>-<project>-<name>.
+#   secretType=repo-creds -> TENANT-level credential template for every
+#     repo under the URL prefix (project FORBIDDEN — these are NOT
+#     project-scoped in Argo CD; any project of the tenant whose
+#     sourceRepos matches the prefix gets these creds). Only use
+#     tenant-unique prefixes. Secret repo-creds-<tenant>-<name>; not
+#     coupled to any project's lifecycle.
 #   credType=none (repository only) -> metadata-only attachment, plain
 #     Secret, no Vault: creds resolve from the tenant's repo-creds
 #     template. Use it to attach an already-credentialed URL to a second
@@ -32,14 +37,22 @@ spec:
     apiVersion: v1alpha1
     kind: ArgoCDProjectRepository
     spec:
-      # Must match an ArgoCDProject instance's spec.tenant + spec.name.
+      # tenant must match an ArgoCDProject's spec.tenant.
       tenant: string | required=true pattern="^[a-z0-9]([a-z0-9-]{0,28}[a-z0-9])?$"
-      project: string | required=true pattern="^[a-z0-9]([a-z0-9-]{0,28}[a-z0-9])?$"
+      # project: REQUIRED for secretType=repository (the entry is
+      # project-scoped, must match an ArgoCDProject's spec.name), and
+      # FORBIDDEN for secretType=repo-creds (those are TENANT-scoped
+      # credential templates matched by URL prefix — they serve every
+      # project of the tenant, so tying them to one project is fiction
+      # and wrongly couples their lifecycle to that project). Enforced by
+      # platform-policies.yaml.
+      project: string | pattern="^[a-z0-9]([a-z0-9-]{0,28}[a-z0-9])?$"
       # Short repo name, used in resource/secret names and the Vault path.
       name: string | required=true pattern="^[a-z0-9]([a-z0-9-]{0,28}[a-z0-9])?$"
       url: string | required=true
-      # "repository" for a single repo, "repo-creds" for a credential
-      # template applied to every repo under the URL prefix.
+      # "repository" for a single project-scoped repo, "repo-creds" for a
+      # TENANT-level credential template applied to every repo under the
+      # URL prefix.
       secretType: string | default="repository" enum="repository,repo-creds"
       repoType: string | default="git" enum="git,helm"
       # Helm OCI registry (oci:// url). Argo CD models these as
@@ -177,8 +190,11 @@ spec:
                   text: '{{- get .Secrets "sshPrivateKey" -}}'
 
     # ------------------------------------------------------------------
-    # repo-creds + https — creds-only keys; NOT project-scoped in Argo CD
-    # (see header note).
+    # repo-creds + https — TENANT-level credential template (creds-only
+    # keys; NOT project-scoped in Argo CD). Name/path/labels are
+    # tenant-level: no project (it serves every project of the tenant
+    # whose sourceRepos match the URL prefix). Vault path:
+    #   <mount>/<pathPrefix>/<tenant>/repo-creds/<name>
     # ------------------------------------------------------------------
     - id: credsHttps
       includeWhen:
@@ -188,27 +204,25 @@ spec:
         apiVersion: secrets.hashicorp.com/v1beta1
         kind: VaultStaticSecret
         metadata:
-          name: repo-${schema.spec.tenant}-${schema.spec.project}-${schema.spec.name}
+          name: repo-creds-${schema.spec.tenant}-${schema.spec.name}
           namespace: argocd
           labels:
             example.com/tenant: ${schema.spec.tenant}
-            example.com/project: ${schema.spec.project}
         spec:
           vaultAuthRef: ${schema.spec.vault.authRef}
           namespace: ${schema.spec.vault.namespace}
           mount: ${schema.spec.vault.mount}
           type: kv-v2
-          path: ${schema.spec.vault.pathPrefix}/${schema.spec.tenant}/${schema.spec.project}/repos/${schema.spec.name}
+          path: ${schema.spec.vault.pathPrefix}/${schema.spec.tenant}/repo-creds/${schema.spec.name}
           refreshAfter: ${schema.spec.vault.refreshAfter}
           hmacSecretData: true
           destination:
-            name: repo-${schema.spec.tenant}-${schema.spec.project}-${schema.spec.name}
+            name: repo-creds-${schema.spec.tenant}-${schema.spec.name}
             create: true
             overwrite: true
             labels:
               argocd.argoproj.io/secret-type: repo-creds
               example.com/tenant: ${schema.spec.tenant}
-              example.com/project: ${schema.spec.project}
             transformation:
               excludes:
                 - .*
@@ -226,7 +240,7 @@ spec:
                   text: '{{- get .Secrets "password" -}}'
 
     # ------------------------------------------------------------------
-    # repo-creds + ssh
+    # repo-creds + ssh — TENANT-level (see credsHttps).
     # ------------------------------------------------------------------
     - id: credsSsh
       includeWhen:
@@ -236,27 +250,25 @@ spec:
         apiVersion: secrets.hashicorp.com/v1beta1
         kind: VaultStaticSecret
         metadata:
-          name: repo-${schema.spec.tenant}-${schema.spec.project}-${schema.spec.name}
+          name: repo-creds-${schema.spec.tenant}-${schema.spec.name}
           namespace: argocd
           labels:
             example.com/tenant: ${schema.spec.tenant}
-            example.com/project: ${schema.spec.project}
         spec:
           vaultAuthRef: ${schema.spec.vault.authRef}
           namespace: ${schema.spec.vault.namespace}
           mount: ${schema.spec.vault.mount}
           type: kv-v2
-          path: ${schema.spec.vault.pathPrefix}/${schema.spec.tenant}/${schema.spec.project}/repos/${schema.spec.name}
+          path: ${schema.spec.vault.pathPrefix}/${schema.spec.tenant}/repo-creds/${schema.spec.name}
           refreshAfter: ${schema.spec.vault.refreshAfter}
           hmacSecretData: true
           destination:
-            name: repo-${schema.spec.tenant}-${schema.spec.project}-${schema.spec.name}
+            name: repo-creds-${schema.spec.tenant}-${schema.spec.name}
             create: true
             overwrite: true
             labels:
               argocd.argoproj.io/secret-type: repo-creds
               example.com/tenant: ${schema.spec.tenant}
-              example.com/project: ${schema.spec.project}
             transformation:
               excludes:
                 - .*

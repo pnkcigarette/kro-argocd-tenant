@@ -128,14 +128,23 @@ delete and re-register.
   claim-built `destinations` bound what each project may do. `in-cluster`
   destinations get a server-form entry too; the project's own source
   namespace is always appended so the bootstrap app-of-apps works.
-- **Repository secrets** carry `project: <tenant>-<name>` — usable only
-  by that AppProject. (`repo-creds` templates are NOT project-scoped in
-  Argo CD; only use tenant-unique URL prefixes.) Argo CD project-scoped
-  repo entries are 1:1 with an AppProject, so attaching the same URL to
-  a second project is a second lightweight instance — use
-  **`credType: none`** for it: a metadata-only entry (no credentials, no
-  Vault) whose creds resolve from the tenant's repo-creds template. One
-  credential in Vault, N project attachments.
+- **Repository entries are project-scoped; repo-creds are tenant-scoped.**
+  `secretType: repository` (the default) renders a secret carrying
+  `project: <tenant>-<name>` (usable only by that AppProject) and
+  **requires** `spec.project`. `secretType: repo-creds` is a credential
+  *template* matched by URL prefix — it is NOT project-scoped in Argo CD
+  and serves every project of the tenant whose `sourceRepos` match the
+  prefix, so it **forbids** `spec.project`, renders as a tenant asset
+  (`repo-creds-<tenant>-<name>`, Vault path
+  `<mount>/<pathPrefix>/<tenant>/repo-creds/<name>`, tenant label only),
+  and is **not** coupled to any project's lifecycle (offboarding a
+  project won't ask you to delete it; it's torn down with the tenant).
+  Use tenant-unique prefixes only.
+- **Attaching one URL to a second project** (Argo CD repo entries are 1:1
+  with an AppProject) is a second lightweight instance — use
+  **`credType: none`**: a metadata-only project-scoped entry (no
+  credentials, no Vault) whose creds resolve from the tenant's repo-creds
+  template. One credential in Vault, N project attachments.
 - **`argocd-project-binding`**: any Application/ApplicationSet in a
   namespace labeled `example.com/tenant` + `example.com/project` must set
   `spec.project` to `<tenant>-<project>` — readable failure at admission;
@@ -220,6 +229,15 @@ claim registry (`ArgoCDProject` destinations).
   violations instead of blocking.
 - **Removing a claim** releases the namespace record but does not delete
   the namespace on the target cluster; clean up out of band.
+- **Shared assets are decoupled from single-project lifecycles.** A
+  tenant `repo-creds` template serves multiple projects, so it does not
+  block any one project's deletion — but that also means deleting or
+  rotating it affects every project of the tenant using the prefix
+  (including `credType: none` attachments). Coordinate rotation; there is
+  no admission guard because rotation is legitimate. Likewise a shared
+  `ArgoCDCluster` can't be deleted while *any* project references it in
+  `destinations` — decommissioning it means removing that destination
+  from every referencing project first (the referential guard lists who).
 - **Changing `environment` (or `assigneeGroup` / the group overrides)
   rotates derived RBAC in place.** These are mutable; editing them
   re-derives the AppProject viewer/admin groups on the next reconcile
@@ -311,7 +329,7 @@ run Kyverno's admission controller HA (≥2 replicas).
 
 ## Tests
 
-`tests/policy-tests.sh` — deny/allow matrix (47 checks) covering claims,
+`tests/policy-tests.sh` — deny/allow matrix (51 checks) covering claims,
 sharing, squatting, brownfield, identity immutability, offboarding order,
 bootstrap rendering (auto/helm/recurse), label merging, LDAP group
 derivation/override, CSV-injection denial, agent clusters, credType=none

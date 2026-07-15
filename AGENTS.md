@@ -155,13 +155,27 @@ CRDs, VSO main CRDs. Re-verify before assuming on other versions.
 - Identity fields are immutable (project `tenant`+`name`; repo
   `tenant`+`project`+`name`; cluster `name`+`server`) — renaming makes
   KRO prune-and-recreate, destroying namespaces/workloads/secrets.
-- Repository secrets carry `project: <tenant>-<name>`; `repo-creds`
-  are NOT project-scoped in Argo CD — tenant-unique URL prefixes only.
-  Project-scoped repo entries are 1:1 with an AppProject (single-valued
-  `project` field) — same-URL-in-second-project = a second instance with
-  `credType: none` (metadata-only plain Secret, vault block FORBIDDEN,
-  repository secretType only; creds resolve from the tenant repo-creds
-  template). Five repo variants total.
+- Repository entries are PROJECT-scoped (secret carries
+  `project: <tenant>-<name>`; `spec.project` REQUIRED); `repo-creds` are
+  TENANT-scoped credential templates (matched by URL prefix, serve every
+  project of the tenant; `spec.project` FORBIDDEN; render
+  `repo-creds-<tenant>-<name>`, Vault path
+  `<mount>/<pathPrefix>/<tenant>/repo-creds/<name>`, tenant label only;
+  NOT coupled to any project's lifecycle — the referential guard skips
+  no-project repos). `spec.project` is therefore OPTIONAL in the schema
+  (making a required field optional is a loosening → applied in place, no
+  migration; verified) with required-vs-forbidden enforced by policy, and
+  the dup/immutability rules key on (tenant,project,name) for repository
+  vs (tenant,name) for repo-creds via `has(project)` comparison.
+  Same-URL-in-second-project = a `credType: none` repository instance
+  (metadata-only plain Secret, vault FORBIDDEN, repository only; creds
+  resolve from the tenant repo-creds template). Five repo variants total.
+- **Design principle (found via a repo-creds gotcha):** a tenant/shared
+  asset must NOT be modeled as project-scoped — it misleads (implies
+  scoping Argo doesn't apply) and, worse, the referential guard chains
+  its lifecycle to one arbitrary project. When adding a resource, ask "is
+  this per-project or per-tenant/shared?" and scope the identity, labels,
+  Vault path, and referential guards accordingly.
 - Cluster `server` immutability has ONE sanctioned in-place transition:
   credentialed -> agent (provider=agent + synthetic server together);
   name unchanged so claims/destinations are untouched and KRO prunes the

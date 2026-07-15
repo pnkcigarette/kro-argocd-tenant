@@ -542,15 +542,29 @@ spec:
       expression: >-
         resource.List("kro.run/v1alpha1", "argocdprojectrepositories", "").items
   validations:
-    # tenant+project+name are the identity: they name the Argo CD Secret
-    # and the Vault path. Immutable.
+    # project scope: REQUIRED for repository/none (project-scoped repo
+    # entry), FORBIDDEN for repo-creds (tenant-level credential template
+    # serving every project of the tenant — tying it to one project is
+    # fiction and wrongly couples its lifecycle to that project).
+    - expression: >-
+        object.spec.secretType != 'repository' ||
+        (has(object.spec.project) && object.spec.project != '')
+      message: secretType=repository requires spec.project (the owning project)
+    - expression: >-
+        object.spec.secretType != 'repo-creds' || !has(object.spec.project)
+      message: >-
+        spec.project may not be set for secretType=repo-creds — those are
+        tenant-level credential templates, not project-scoped
+    # Identity is immutable: tenant+project+name (repository) or
+    # tenant+name (repo-creds). Renaming orphans the secret.
     - expression: >-
         request.operation != 'UPDATE' ||
         (object.spec.tenant == oldObject.spec.tenant &&
-         object.spec.project == oldObject.spec.project &&
-         object.spec.name == oldObject.spec.name)
+         object.spec.name == oldObject.spec.name &&
+         has(object.spec.project) == has(oldObject.spec.project) &&
+         (!has(object.spec.project) || object.spec.project == oldObject.spec.project))
       message: >-
-        ArgoCDProjectRepository spec.tenant/spec.project/spec.name are immutable
+        ArgoCDProjectRepository identity (tenant/project/name) is immutable
         (renaming orphans the repo secret) — delete and recreate instead
     # The vault block itself must be present — nested required= markers
     # only apply when the parent object exists. credType=none is the
@@ -574,15 +588,17 @@ spec:
         object.spec.url.startsWith('https://') || object.spec.url.startsWith('oci://') ||
         object.spec.url.startsWith('git@') || object.spec.url.startsWith('ssh://')
       message: credType=none requires an https://, oci://, git@, or ssh:// url
-    # One instance per (tenant, project, name).
+    # One instance per identity: (tenant, project, name) for repository,
+    # (tenant, name) for repo-creds. Same-scope comparison via has().
     - expression: >-
         !dyn(variables.repoList).exists(r,
           r.spec.tenant == object.spec.tenant &&
-          r.spec.project == object.spec.project &&
           r.spec.name == object.spec.name &&
+          has(r.spec.project) == has(object.spec.project) &&
+          (!has(object.spec.project) || r.spec.project == object.spec.project) &&
           (r.metadata.name != object.metadata.name ||
            r.metadata.namespace != object.metadata.namespace))
-      message: another ArgoCDProjectRepository instance already defines this tenant/project/name
+      message: another ArgoCDProjectRepository instance already defines this identity
     - expression: >-
         object.spec.credType != 'https' ||
         object.spec.url.startsWith('https://') || object.spec.url.startsWith('oci://')
@@ -772,9 +788,14 @@ spec:
     - name: projectList
       expression: resource.List("kro.run/v1alpha1", "argocdprojects", "").items
   validations:
+    # Only PROJECT-scoped repos (has project) block their project's
+    # deletion. repo-creds are tenant-level (no project) — they serve
+    # multiple projects, so they must NOT chain to any one project's
+    # lifecycle; they're torn down with the tenant.
     - expression: >-
         oldObject.kind != 'ArgoCDProject' ||
         !dyn(variables.repoList).exists(r,
+          has(r.spec.project) &&
           r.spec.tenant == oldObject.spec.tenant &&
           r.spec.project == oldObject.spec.name)
       message: >-
