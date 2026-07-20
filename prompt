@@ -1,0 +1,73 @@
+Read AGENTS.md first and follow
+it strictly — the KRO rules, Kyverno rules, and testing conventions all
+apply. PRECONDITION: this assumes NO live ArgoCDProject instances exist
+with bootstrap.helmValueFiles or bootstrap.recurse set (pre-publication
+cleanup). If you find any on the cluster, STOP and report instead.
+
+TASK: simplify bootstrap to the single "seed pattern" pointer by
+removing the helm and recurse variants.
+
+1. rgd-argocd-project.yaml:
+   - Schema: remove bootstrap.helmValueFiles and bootstrap.recurse.
+     Keep repoUrl, path (default argo-apps), targetRevision (default
+     HEAD) exactly as they are.
+   - Resources: remove the bootstrapHelmApp and bootstrapRecurseApp
+     variants entirely. Keep the auto variant (id: bootstrapApp) as
+     the ONLY bootstrap resource; simplify its includeWhen to just the
+     repoUrl-set condition (the exclusivity conditions are now
+     meaningless). Do NOT add a source.directory or source.helm block
+     to it — auto-detect stays (deliberate: a team may kustomize-
+     generate their seed manifests).
+   - Comments (header flow notes + bootstrap block + the variant):
+     document the seed pattern as THE bootstrap model — the rendered
+     app is a frozen pointer at argo-apps/ on the control repo's
+     default branch; that dir holds team-owned Application/
+     ApplicationSet "root" manifests; everything below the roots
+     (repos, branches, tools, helm valueFiles, appsets, cardinality)
+     is the team's, expressed as Git diffs. A helm app-of-apps with
+     per-env values is a root Application carrying source.helm in
+     Git — no longer a platform knob. targetRevision is a set-once
+     escape hatch (e.g. compliance), not a day-2 surface. Note two
+     conventions: argo-apps/ contains entry-point manifests only (a
+     stray Chart.yaml would flip auto-detection), and no manifest in
+     it may be named "bootstrap" (collides with this rendered parent).
+
+2. platform-policies.yaml: remove the bootstrap tool-knob rules — the
+   helmValueFiles/recurse mutual-exclusivity rule and the relative-
+   path valueFiles rule. Touch nothing else.
+
+3. README.md:
+   - Flow section: rewrite the bootstrap paragraph around the seed
+     pattern. Include the contract sentence verbatim: "Your project's
+     entry point is argo-apps/ on your control repo's default branch;
+     it must contain at least one Application or ApplicationSet
+     manifest, and everything below it is yours." Drop the
+     helmValueFiles/recurse explanation; state that helm/kustomize/
+     per-env tooling lives on the team's root manifests in Git.
+   - Known limitations: update the bootstrap entries — the three-
+     variant note goes away; keep/add: seed dir contents are
+     convention (entry-point manifests only, not admission-enforced),
+     and the name "bootstrap" is reserved by convention.
+   - Tests section: update the bootstrap coverage description
+     (auto-only now).
+
+4. MIGRATION on kind-kro-validate (removing schema fields is a
+   breaking RGD change — follow the AGENTS.md runbook exactly):
+   delete existing ArgoCDProject instances, delete the RGD, delete its
+   CRD explicitly, strip any stranded kro.run finalizers, re-apply the
+   new RGD, wait for the CRD to be established and the RGD Active.
+   If subsequent project writes fail with "not found in group",
+   restart the Kyverno admission controller (known discovery lag).
+
+5. tests/policy-tests.sh: remove the helm/recurse rendering cases and
+   the tool-knob exclusivity/valueFiles-path deny cases. Keep/verify:
+   auto bootstrap renders when repoUrl is set; no bootstrap app when
+   repoUrl is empty. Follow existing conventions (unique identities,
+   assert deny reasons, cleanup).
+
+VERIFY: apply order RGDs → CRDs established → platform-policies →
+tests/preflight.sh (must pass) → full tests/policy-tests.sh (every
+case must pass) → create the examples/tenant-teamx.yaml project with
+bootstrap.repoUrl set and confirm the instance goes ACTIVE and renders
+exactly one bootstrap Application with a bare source block (no helm,
+no directory).
