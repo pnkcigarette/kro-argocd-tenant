@@ -1,0 +1,77 @@
+Create a new project: gitlab-prefix-verifier — a small Kubernetes
+operator that automates "protected prefix" stamping for the
+kro-argocd-tenant platform. Read that repo's README/AGENTS.md for
+context: mgmt namespaces carry platform-guarded identity labels
+(example.com/tenant) and an example.com/protected-prefixes JSON-array
+annotation that admission policies treat as the source of truth for
+tenant-exclusive GitLab prefixes. Today the platform stamps it
+manually; this operator takes over. Its SA must simply be added to
+the existing allowed-stampers policy list — do not redesign that
+contract.
+
+1. CRD: GitLabPrefixClaim (namespaced — lives in the tenant's mgmt
+   namespace):
+   spec:
+     prefix: string            # normalized URL prefix being claimed
+     proofTokenSecretRef:      # Secret in the SAME namespace holding
+       name/key                # a maintainer-level GitLab token
+   status:
+     phase: Pending|Verified|Failed|Stale
+     reason, lastVerified, observedGeneration
+   Normalization rules must match the platform's (https, lowercase
+   host, no trailing slash, no .git) — validate and normalize on
+   reconcile; reject non-conforming prefixes with a clear status.
+
+2. RECONCILE (controller-runtime, Go):
+   - Resolve the group/sub-group path from the prefix; call the
+     GitLab API using ONLY the claim's proof token (the operator
+     holds no standing GitLab credentials — per-claim tokens only).
+   - Verify the token's effective access level on that exact group is
+     Maintainer (40) or Owner (50) — inherited membership counts;
+     access to a parent group does NOT verify a claim on a different
+     subtree; access to only a sub-group does NOT verify the parent.
+   - Cross-tenant exclusivity: before stamping, list all mgmt
+     namespaces (label example.com/tenant exists) and reject if the
+     prefix equals/prefixes/is-prefixed-by any prefix already stamped
+     on a DIFFERENT tenant's namespace (defense in depth — admission
+     also checks overlap, but the operator must not race it).
+   - On success: append the prefix to the claim's namespace
+     example.com/protected-prefixes annotation (JSON array,
+     de-duplicated, SSA with a dedicated field manager) and set
+     status Verified.
+   - On failure: status Failed with an actionable reason (token
+     invalid / insufficient access level / wrong group / overlap).
+
+3. RE-VERIFICATION:
+   - Re-check Verified claims on a configurable interval (default
+     24h). On lost maintainership or dead token: set Stale (do NOT
+     auto-remove the stamp — the platform's referential policy blocks
+     unstamping while repo-creds exist; removal is a human/alerted
+     act). Emit a Kubernetes Event and a metric on every transition.
+   - Claim deletion: remove the prefix from the annotation IFF no
+     ArgoCDProjectRepository repo-creds instance in that namespace
+     still uses it; otherwise block via finalizer with a status
+     message (mirror the platform's one-directional referential
+     rule — never create a cycle).
+
+4. SECURITY:
+   - RBAC: get/list/watch GitLabPrefixClaims + Secrets ONLY in
+     namespaces labeled example.com/tenant; patch Namespaces
+     (annotation only — document that field-level restriction isn't
+     enforceable in RBAC, so keep the controller minimal and audited);
+     events. Nothing cluster-write beyond that.
+   - Never log tokens; proof tokens are read per-reconcile, never
+     cached to disk.
+   - Rate-limit GitLab API calls; exponential backoff on 429/5xx.
+
+5. TESTS: envtest for reconcile paths (verified, insufficient
+   access, parent/sub-group mismatch, overlap rejection, stale
+   transition, deletion-with-finalizer); a fake GitLab API server for
+   unit tests; document a manual e2e checklist against a real GitLab
+   group.
+
+6. DELIVERY: Dockerfile, kustomize deploy manifests (namespace,
+   RBAC, deployment), metrics endpoint, README covering: the stamp
+   contract it fulfills, the one-line platform change to activate it
+   (add its SA to allowed-stampers), and the runbook for Stale
+   claims.

@@ -1,0 +1,72 @@
+Read AGENTS.md first. This builds
+on the ArgoCDProjectRepository rework (mgmt-namespace residency, BYOC
+Vault, pull-mode replication, project-scoped-only entries).
+
+TASK: add a tenant-level repo-creds (credential template) variant,
+gated on a platform-stamped "protected prefix" — designed so a future
+verifier service can take over stamping with zero changes here.
+
+1. THE STAMP (the contract):
+   - Mgmt namespaces may carry annotation
+     example.com/protected-prefixes: JSON array of normalized GitLab
+     URL prefixes (e.g. ["https://gitlab.example.com/acme/payments"]).
+     Document the normalization rules (https scheme, lowercase host,
+     no trailing slash, no .git) and apply them consistently in every
+     rule below.
+   - Policy: this annotation is writable ONLY by principals in an
+     allowed-stampers list (platform SA today; structure the rule so
+     adding a future verifier SA is a one-line change — comment this
+     as the extension seam).
+   - Overlap rule: a new/changed stamp may not equal, prefix, or be
+     prefixed by any prefix stamped on ANY OTHER mgmt namespace.
+   - Referential: removing a prefix from the stamp is denied while a
+     repo-creds instance under that prefix exists in that namespace
+     (one direction only, per AGENTS.md deadlock rule).
+
+2. REPO-CREDS CR VARIANT (ArgoCDProjectRepository):
+   - credType: repo-creds — spec.project FORBIDDEN (tenant-level),
+     spec.url must fall under a prefix stamped on the CR's OWN mgmt
+     namespace (policy-enforced; deny reason must say verification/
+     stamping is the missing prerequisite).
+   - Renders: VSS in the mgmt namespace (BYOC, replicator consent
+     annotations as per the repository flow) + a data-free repo-creds
+     stub in argocd: argocd.argoproj.io/secret-type: repo-creds, url,
+     tenant label, replicate-from annotation, NO project field, NO
+     data field.
+   - Dup rule: one repo-creds per (tenant, url) across all mgmt
+     namespaces.
+
+3. POLICY UPDATES (comment the load-bearing set — stamp + variant +
+   denial are a package; removing any one reopens the cross-tenant
+   credential leak):
+   - Cross-tenant denial: ArgoCDProject spec.sourceRepos entries and
+     repository CR spec.url values are DENIED if they fall under a
+     prefix stamped on a DIFFERENT tenant's mgmt namespace. (Same-
+     tenant use is allowed, including sourceRepos globs like
+     <prefix>/*.)
+   - argocd secret guard: change "deny secret-type repo-creds
+     outright" to "deny repo-creds secrets that are not KRO-rendered
+     stubs"; replicator may fill data only on existing KRO-owned
+     stubs; cluster secret-type via replication remains denied.
+
+4. TESTS (existing conventions):
+   - Deny: repo-creds with spec.project; repo-creds URL not under own
+     stamp; repo-creds URL under ANOTHER tenant's stamp; other
+     tenant's sourceRepos/repo URL under a stamped prefix; stamp
+     write by non-platform principal; overlapping stamp across
+     namespaces; stamp removal while repo-creds exists; dup
+     (tenant,url).
+   - Allow/render: stamped tenant self-serves repo-creds; stub
+     renders with repo-creds type, no project, no data; same tenant's
+     sourceRepos glob under own prefix admits.
+   - URL normalization: trailing-slash/.git/case variants of a
+     stamped prefix behave identically in every rule (mismatched
+     normalization is a bypass — test it explicitly).
+
+5. DOCS: README repo section — when to use project-scoped entries
+   (default) vs repo-creds (hundreds of repos; needs a stamped
+   prefix); how stamping happens today (onboarding/platform) and that
+   a verifier service will automate it later; the sourceRepos glob
+   pattern for template users.
+
+Verify per AGENTS.md: RGDs Active, preflight, full suite passes.
